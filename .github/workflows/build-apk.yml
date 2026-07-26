@@ -1,0 +1,74 @@
+name: Build APK
+
+# Compila el APK de Android y lo publica como Release descargable.
+# No necesita cuenta de Expo ni secretos: la carpeta android/ se genera con
+# `expo prebuild` y Gradle firma el release con el keystore de debug que trae
+# la plantilla, que es suficiente para instalar por sideload.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Generar proyecto nativo
+        # android/ está en .gitignore, así que se regenera en cada build a
+        # partir de app.json y los config plugins.
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Compilar APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Renombrar APK
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             "out/sk-music-v${{ github.run_number }}.apk"
+
+      - name: Publicar Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: SK Music v1.0.${{ github.run_number }}
+          body: |
+            APK de Android listo para instalar.
+
+            Descarga `sk-music-v${{ github.run_number }}.apk` desde los archivos
+            de abajo. En el teléfono hay que permitir la instalación desde
+            orígenes desconocidos la primera vez.
+          files: out/*.apk
+
+      - name: Subir APK como artefacto
+        # Respaldo por si el Release falla; este requiere estar logueado en
+        # GitHub para descargarlo.
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk-music-apk
+          path: out/*.apk
