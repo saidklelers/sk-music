@@ -36,12 +36,17 @@ export type SearchResult = {
 /**
  * Clientes Innertube en orden de preferencia.
  *
- * IOS y ANDROID van primero porque entregan las URLs de audio ya en claro, sin
- * firma que descifrar. Eso importa mucho: la sesión se crea con
- * `retrieve_player: false` para no bloquear el hilo de JS, así que un formato
- * cifrado directamente no se puede usar y se descarta.
+ * IOS va primero porque es el único que, medido en dispositivo, entrega la URL
+ * de audio ya en claro. ANDROID queda de respaldo: hoy devuelve el formato sin
+ * URL directa, pero eso cambia con el tiempo y no cuesta nada intentarlo.
+ *
+ * Esto importa porque la sesión se crea con `retrieve_player: false` para no
+ * bloquear el hilo de JS, así que un formato cifrado no se puede usar.
+ *
+ * YTMUSIC_ANDROID se quitó: YouTube responde 400 a ese cliente de forma
+ * consistente, así que solo añadía ruido al mensaje de error.
  */
-const CLIENTS = ['IOS', 'ANDROID', 'YTMUSIC_ANDROID'] as const;
+const CLIENTS = ['IOS', 'ANDROID'] as const;
 
 /** Tope por etapa. Evita que la UI se quede colgada sin decir nada. */
 const STAGE_TIMEOUT_MS = 25_000;

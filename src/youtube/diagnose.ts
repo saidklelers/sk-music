@@ -6,7 +6,10 @@ import { getInnertube, resetInnertube } from './innertube';
  */
 const PROBE_ID = 'dQw4w9WgXcQ';
 
-const CLIENTS = ['IOS', 'ANDROID', 'YTMUSIC_ANDROID'] as const;
+const CLIENTS = ['IOS', 'ANDROID'] as const;
+
+/** Tope de la prueba de red. Sin esto puede quedarse minutos y no se ve. */
+const NET_PROBE_TIMEOUT_MS = 45_000;
 
 /**
  * Prueba la cadena de resolución paso a paso y devuelve un informe legible.
@@ -20,15 +23,26 @@ export async function diagnose(): Promise<string> {
   const out: string[] = [];
   const stamp = (start: number) => `${Date.now() - start} ms`;
 
-  /* 1. Red. */
+  /* 1. Red. Con tope propio: sin él esta prueba llegó a tardar 4 minutos en
+     frío, que era justo el dato que había que ver y no quedarse esperando. */
   const tNet = Date.now();
+  const controller = new AbortController();
+  const netTimer = setTimeout(() => controller.abort(), NET_PROBE_TIMEOUT_MS);
   try {
-    const res = await fetch('https://www.youtube.com/generate_204');
-    out.push(`Red: OK (HTTP ${res.status}, ${stamp(tNet)})`);
-  } catch (err) {
-    out.push(`Red: FALLA — ${err instanceof Error ? err.message : 'error'}`);
+    const res = await fetch('https://www.youtube.com/generate_204', {
+      signal: controller.signal,
+    });
+    const ms = Date.now() - tNet;
+    out.push(`Red: OK (HTTP ${res.status}, ${ms} ms)`);
+    if (ms > 5000) {
+      out.push('   ⚠ arranque en frío lento — probablemente DNS o IPv6');
+    }
+  } catch {
+    out.push(`Red: FALLA — sin respuesta en ${NET_PROBE_TIMEOUT_MS / 1000} s`);
     out.push('\nNo hay salida a internet. Lo demás no se puede probar.');
     return out.join('\n');
+  } finally {
+    clearTimeout(netTimer);
   }
 
   /* 2. Sesión. Aquí es donde se colgaba con retrieve_player activo. */

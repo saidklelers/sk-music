@@ -2,8 +2,22 @@ import '@/lib/polyfills'; // debe ir primero: youtubei.js lee globals al importa
 
 import { Innertube } from 'youtubei.js';
 
-/** Tope para cualquier petición de red que haga la librería. */
-const REQUEST_TIMEOUT_MS = 20_000;
+/**
+ * Tope por intento.
+ *
+ * 45 s y no 20 porque el arranque en frío puede ser brutal: en pruebas reales
+ * la primera conexión a youtube.com tardó más de 4 minutos (DNS o IPv6
+ * colgándose antes de caer a IPv4) mientras que todas las siguientes tardaron
+ * ~400 ms. No sirve subir el tope hasta cubrir ese peor caso —serían minutos de
+ * app congelada— así que la solución real es el reintento de abajo: al segundo
+ * intento la conexión ya está caliente y responde al instante.
+ */
+const REQUEST_TIMEOUT_MS = 45_000;
+
+/** Reintentos ante fallo o vencimiento. Las llamadas a InnerTube son lecturas. */
+const MAX_RETRIES = 2;
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * `fetch` con tope de tiempo.
@@ -45,6 +59,32 @@ const fetchWithTimeout = async (
   }
 };
 
+/**
+ * Reintenta ante vencimiento o fallo de red.
+ *
+ * Es la pieza que de verdad resuelve el arranque en frío: si el primer intento
+ * se queda esperando a que resuelva el DNS, el timeout lo corta y el segundo
+ * sale por una conexión ya establecida. Sólo se reintenta el transporte —un 400
+ * o un 403 de YouTube se propaga tal cual, porque reintentarlo no cambia nada.
+ */
+const fetchWithRetry = async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> => {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fetchWithTimeout(input, init);
+    } catch (err) {
+      lastError = err;
+      if (attempt < MAX_RETRIES) await delay(400 * 2 ** attempt);
+    }
+  }
+
+  throw lastError;
+};
+
 let pending: Promise<Innertube> | null = null;
 
 /**
@@ -69,13 +109,25 @@ export function getInnertube(): Promise<Innertube> {
       retrieve_player: false,
       generate_session_locally: true,
       enable_session_cache: false,
-      fetch: fetchWithTimeout,
+      fetch: fetchWithRetry,
     }).catch((err) => {
       pending = null;
       throw err;
     });
   }
   return pending;
+}
+
+/**
+ * Adelanta el arranque en frío.
+ *
+ * Se llama al abrir la app para que el coste de la primera conexión —que puede
+ * ser de minutos— se pague en segundo plano y no cuando el usuario ya pegó un
+ * link y está esperando. Deliberadamente no propaga errores: si falla, la
+ * descarga real volverá a intentarlo y mostrará el problema entonces.
+ */
+export function warmUp() {
+  getInnertube().catch(() => {});
 }
 
 /** Fuerza recrear el cliente. Útil cuando YouTube invalida la sesión. */
