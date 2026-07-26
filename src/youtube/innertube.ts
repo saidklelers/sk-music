@@ -2,26 +2,54 @@ import '@/lib/polyfills'; // debe ir primero: youtubei.js lee globals al importa
 
 import { Innertube } from 'youtubei.js';
 
+/** Tope para cualquier petición de red que haga la librería. */
+const REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * `fetch` con tope de tiempo.
+ *
+ * React Native no aplica ningún timeout por defecto, así que una petición que
+ * se queda colgada lo hace para siempre y la descarga se congela sin dar error.
+ * Inyectando esto en la sesión, toda llamada de la librería queda acotada.
+ */
+const fetchWithTimeout = async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
 let pending: Promise<Innertube> | null = null;
 
 /**
  * Cliente Innertube compartido.
  *
- * Crearlo es caro (descarga y parsea el player de YouTube para poder descifrar
- * las URLs de stream), así que se hace una sola vez por sesión. Si falla se
- * limpia la promesa para que el siguiente intento reintente de cero en vez de
- * quedar cacheado en estado de error.
+ * `retrieve_player: false` es la decisión importante acá. Con el player activo,
+ * la librería descarga el base.js de YouTube (~2 MB minificados) y lo parsea con
+ * meriyah, que es un parser escrito en JavaScript: sobre Hermes, en un teléfono,
+ * eso bloquea el hilo de JS durante muchísimo tiempo y la app se queda congelada
+ * en "Resolviendo".
+ *
+ * No lo necesitamos: el player sirve solo para descifrar firmas, y los clientes
+ * IOS y ANDROID —los dos primeros que probamos— entregan las URLs de audio ya
+ * en claro. Ver `pickAudioFormat` en resolve.ts, que descarta cualquier formato
+ * que sí venga cifrado en lugar de intentar descifrarlo.
  */
 export function getInnertube(): Promise<Innertube> {
   if (!pending) {
     pending = Innertube.create({
       lang: 'es',
       location: 'CO',
-      retrieve_player: true,
+      retrieve_player: false,
       generate_session_locally: true,
-      // Sin caché en disco: el polyfill de mmkvStorage vive en memoria y la
-      // sesión se regenera barato en cada arranque.
       enable_session_cache: false,
+      fetch: fetchWithTimeout,
     }).catch((err) => {
       pending = null;
       throw err;

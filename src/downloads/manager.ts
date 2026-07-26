@@ -1,7 +1,7 @@
 import { File } from 'expo-file-system';
 
 import type { Track } from '@/db';
-import { resolveTrack, type ResolvedTrack } from '@/youtube/resolve';
+import { resolveTrack, STAGE_LABEL, type ResolvedTrack } from '@/youtube/resolve';
 
 import { artworkFile, ensureDirs, trackFile } from './storage';
 
@@ -17,6 +17,11 @@ export type DownloadJob = {
   /** 0..1, o null mientras no se conozca el tamaño total. */
   progress: number | null;
   error: string | null;
+  /**
+   * Detalle de en qué punto de la resolución va. Se muestra en la UI para que
+   * un fallo sea diagnosticable en vez de un "Resolviendo" eterno.
+   */
+  stage: string | null;
 };
 
 type Listener = () => void;
@@ -95,6 +100,7 @@ class DownloadManager {
       status: 'resolving',
       progress: null,
       error: null,
+      stage: null,
       // `idOrUrl` se conserva aparte porque puede ser una URL completa.
     });
     this.pendingInput.set(id, idOrUrl);
@@ -157,8 +163,10 @@ class DownloadManager {
       ensureDirs();
 
       /* 1. Resolver metadatos + URL de stream. */
-      this.patch(id, { status: 'resolving', progress: null });
-      const resolved = await resolveTrack(input);
+      this.patch(id, { status: 'resolving', progress: null, stage: null });
+      const resolved = await resolveTrack(input, (stage) =>
+        this.patch(id, { stage: STAGE_LABEL[stage] }),
+      );
       if (this.cancelled.has(id)) return;
 
       this.patch(id, {
@@ -167,6 +175,7 @@ class DownloadManager {
         thumbnailUrl: resolved.thumbnailUrl,
         status: 'downloading',
         progress: 0,
+        stage: null,
       });
 
       /* 2. Bajar el audio con progreso. */

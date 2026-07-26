@@ -1,6 +1,6 @@
 import Constants from 'expo-constants';
 import { useCallback, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Logo } from '@/components/Logo';
@@ -9,12 +9,28 @@ import { availableSpace, pruneOrphans } from '@/downloads/storage';
 import { useLibrary } from '@/library/LibraryProvider';
 import { formatBytes, pluralTracks } from '@/lib/format';
 import { colors, layout, radius, space, type } from '@/theme';
+import { diagnose } from '@/youtube/diagnose';
 import { resetInnertube } from '@/youtube/innertube';
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { tracks, playlists, librarySize, refresh } = useLibrary();
   const [busy, setBusy] = useState(false);
+  const [report, setReport] = useState<string | null>(null);
+  const [diagnosing, setDiagnosing] = useState(false);
+
+  /** Prueba la cadena completa y deja el informe en pantalla para copiarlo. */
+  const runDiagnosis = useCallback(async () => {
+    setDiagnosing(true);
+    setReport('Probando…');
+    try {
+      setReport(await diagnose());
+    } catch (err) {
+      setReport(`El diagnóstico falló: ${err instanceof Error ? err.message : 'error'}`);
+    } finally {
+      setDiagnosing(false);
+    }
+  }, []);
 
   /** Borra audio y carátulas que quedaron sin registro en la base. */
   const cleanOrphans = useCallback(async () => {
@@ -73,9 +89,23 @@ export default function SettingsScreen() {
           label="Reiniciar conexión con YouTube"
           hint="Úsalo si las descargas empiezan a fallar de un momento a otro."
           onPress={reconnect}
+        />
+        <Action
+          label={diagnosing ? 'Probando…' : 'Probar conexión con YouTube'}
+          hint="Comprueba red, sesión y cada cliente por separado, con tiempos."
+          onPress={() => void runDiagnosis()}
+          disabled={diagnosing}
           last
         />
       </View>
+
+      {!!report && (
+        <View style={styles.report}>
+          <Text style={styles.reportText} selectable>
+            {report}
+          </Text>
+        </View>
+      )}
 
       <SectionLabel>Acerca de</SectionLabel>
       <View style={styles.about}>
@@ -161,6 +191,20 @@ const styles = StyleSheet.create({
   },
   rowLabel: { ...type.body, color: colors.textMuted },
   rowValue: { ...type.body, color: colors.text },
+
+  report: {
+    marginHorizontal: space.lg,
+    marginTop: space.md,
+    padding: space.md,
+    backgroundColor: colors.surfaceHi,
+    borderRadius: radius.md,
+  },
+  reportText: {
+    color: colors.textMuted,
+    fontSize: 12,
+    lineHeight: 19,
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
+  },
 
   action: { paddingHorizontal: space.lg, paddingVertical: 14, gap: 4 },
   actionLabel: { ...type.body, color: colors.text },

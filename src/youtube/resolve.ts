@@ -2,6 +2,15 @@ import type { Innertube } from 'youtubei.js';
 
 import { getInnertube, resetInnertube } from './innertube';
 
+/** Etapas de la resolución, para poder mostrar en qué punto va o dónde falló. */
+export type ResolveStage = 'session' | 'metadata' | 'format';
+
+export const STAGE_LABEL: Record<ResolveStage, string> = {
+  session: 'Conectando con YouTube…',
+  metadata: 'Leyendo el video…',
+  format: 'Buscando el audio…',
+};
+
 /** Metadatos + URL de audio lista para descargar. */
 export type ResolvedTrack = {
   id: string;
@@ -27,18 +36,59 @@ export type SearchResult = {
 /**
  * Clientes Innertube en orden de preferencia.
  *
- * IOS va primero porque devuelve URLs de audio sin cifrar ni estrangular y sin
- * exigir PoToken, que es justo lo que rompe al cliente WEB. Los demás quedan
- * como respaldo por si YouTube cambia el comportamiento de alguno.
+ * IOS y ANDROID van primero porque entregan las URLs de audio ya en claro, sin
+ * firma que descifrar. Eso importa mucho: la sesión se crea con
+ * `retrieve_player: false` para no bloquear el hilo de JS, así que un formato
+ * cifrado directamente no se puede usar y se descarta.
  */
-const CLIENTS = ['IOS', 'ANDROID', 'YTMUSIC_ANDROID', 'WEB'] as const;
+const CLIENTS = ['IOS', 'ANDROID', 'YTMUSIC_ANDROID'] as const;
+
+/** Tope por etapa. Evita que la UI se quede colgada sin decir nada. */
+const STAGE_TIMEOUT_MS = 25_000;
 
 /** Error con mensaje ya listo para mostrarle al usuario. */
 export class ResolveError extends Error {
-  constructor(message: string, readonly cause?: unknown) {
+  constructor(
+    message: string,
+    readonly stage: ResolveStage | null = null,
+    readonly cause?: unknown,
+  ) {
     super(message);
     this.name = 'ResolveError';
   }
+}
+
+/**
+ * Corta una promesa que tarde demasiado.
+ *
+ * Ojo con el alcance real de esto: protege contra una petición de red colgada,
+ * no contra el hilo de JS bloqueado — si algo se pone a hacer trabajo síncrono
+ * pesado, el propio temporizador tampoco corre. Para eso está
+ * `retrieve_player: false` en innertube.ts.
+ */
+function withTimeout<T>(promise: Promise<T>, stage: ResolveStage): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new ResolveError(
+          `Se agotó el tiempo de espera (${STAGE_LABEL[stage].replace('…', '').toLowerCase()}). ` +
+            'Revisa tu conexión e intenta de nuevo.',
+          stage,
+        ),
+      );
+    }, STAGE_TIMEOUT_MS);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**
@@ -95,6 +145,14 @@ function cleanArtist(author: string | undefined): string {
   return (author ?? 'Desconocido').replace(/\s*-\s*Topic$/i, '').trim() || 'Desconocido';
 }
 
+/** Sólo la parte del formato que realmente usamos. */
+type AudioFormat = {
+  url?: string;
+  signature_cipher?: string;
+  cipher?: string;
+  content_length?: number;
+};
+
 /**
  * Elige el mejor stream **solo de audio en m4a/AAC**.
  *
@@ -102,20 +160,22 @@ function cleanArtist(author: string | undefined): string {
  * Android reproduce pero iOS no. m4a/AAC lo entienden los dos, así que pedirlo
  * explícitamente nos evita transcodificar con ffmpeg — algo que no existe en el
  * dispositivo. Está disponible prácticamente en todos los videos.
+ *
+ * Devuelve null si el formato viene cifrado: descifrarlo exigiría el JS player,
+ * y cargarlo cuesta más de lo que vale (ver innertube.ts). Con que uno de los
+ * clientes de la lista dé una URL en claro, alcanza.
  */
-function pickAudioFormat(info: any, yt: Innertube) {
-  const format = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' });
+function pickAudioFormat(format: AudioFormat | undefined) {
   if (!format) return null;
 
-  // Si viene cifrada, decipher() aplica la firma y el descifrado del parámetro
-  // `n` (el que estrangula la velocidad a ~50 KB/s si se ignora).
-  const url: string | undefined = format.decipher
-    ? format.decipher(yt.session.player)
-    : format.url;
-  if (!url) return null;
+  // `format.url` sólo viene cuando YouTube no aplicó firma. Ojo: no sirve
+  // preguntar por `format.decipher`, que es un método del prototipo y por tanto
+  // siempre existe — ese fue justamente el bug que dejaba la URL sin resolver.
+  if (!format.url) return null;
+  if (format.signature_cipher || format.cipher) return null;
 
   return {
-    url,
+    url: format.url,
     bytes: typeof format.content_length === 'number' ? format.content_length : null,
   };
 }
@@ -124,39 +184,57 @@ function pickAudioFormat(info: any, yt: Innertube) {
  * Resuelve un link/ID a metadatos + URL de stream, probando cada cliente hasta
  * que uno entregue un formato usable.
  */
-export async function resolveTrack(input: string): Promise<ResolvedTrack> {
+export async function resolveTrack(
+  input: string,
+  onStage?: (stage: ResolveStage) => void,
+): Promise<ResolvedTrack> {
   const id = parseVideoId(input);
   if (!id) {
     throw new ResolveError('Ese link no es de YouTube. Pega la URL del video o su ID.');
   }
 
+  onStage?.('session');
   let yt: Innertube;
   try {
-    yt = await getInnertube();
+    yt = await withTimeout(getInnertube(), 'session');
   } catch (err) {
     resetInnertube();
-    throw new ResolveError('No se pudo conectar con YouTube. Revisa tu conexión.', err);
+    if (err instanceof ResolveError) throw err;
+    throw new ResolveError(
+      'No se pudo conectar con YouTube. Revisa tu conexión.',
+      'session',
+      err,
+    );
   }
 
-  let lastError: unknown = null;
+  const problems: string[] = [];
 
   for (const client of CLIENTS) {
     try {
-      const info = await yt.getBasicInfo(id, { client });
+      onStage?.('metadata');
+      const info = await withTimeout(yt.getBasicInfo(id, { client }), 'metadata');
       const basic = info.basic_info;
 
-      if (info.playability_status?.status === 'LOGIN_REQUIRED') {
-        throw new ResolveError('El video tiene restricción de edad y no se puede descargar.');
-      }
-      if (info.playability_status?.status === 'UNPLAYABLE') {
+      const status = info.playability_status?.status;
+      if (status === 'LOGIN_REQUIRED') {
         throw new ResolveError(
-          info.playability_status.reason || 'El video no está disponible para reproducir.',
+          'El video tiene restricción de edad y no se puede descargar.',
+          'metadata',
+        );
+      }
+      if (status === 'UNPLAYABLE') {
+        throw new ResolveError(
+          info.playability_status?.reason || 'El video no está disponible para reproducir.',
+          'metadata',
         );
       }
 
-      const audio = pickAudioFormat(info, yt);
+      onStage?.('format');
+      const chosen = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' });
+      const audio = pickAudioFormat(chosen as AudioFormat | undefined);
+
       if (!audio) {
-        lastError = new Error(`El cliente ${client} no devolvió audio m4a`);
+        problems.push(`${client}: sin audio m4a en claro`);
         continue;
       }
 
@@ -165,7 +243,7 @@ export async function resolveTrack(input: string): Promise<ResolvedTrack> {
         title: basic.title?.trim() || 'Sin título',
         artist: cleanArtist(basic.author),
         duration: basic.duration ?? 0,
-        thumbnailUrl: bestThumbnail(basic.thumbnail as any),
+        thumbnailUrl: bestThumbnail(basic.thumbnail as { url: string; width: number }[]),
         streamUrl: audio.url,
         ext: 'm4a',
         approxBytes: audio.bytes,
@@ -173,25 +251,18 @@ export async function resolveTrack(input: string): Promise<ResolvedTrack> {
     } catch (err) {
       // Un fallo de disponibilidad es definitivo; no tiene sentido reintentar
       // con otro cliente porque el video simplemente no se puede bajar.
-      if (err instanceof ResolveError) throw err;
-      lastError = err;
+      if (err instanceof ResolveError && err.stage === 'metadata' && !err.message.startsWith('Se agotó')) {
+        throw err;
+      }
+      problems.push(`${client}: ${err instanceof Error ? err.message : 'error'}`);
     }
   }
 
   throw new ResolveError(
-    'YouTube no entregó un stream de audio utilizable. Puede que hayan cambiado algo: ' +
-      'actualiza youtubei.js y vuelve a compilar.',
-    lastError,
+    `YouTube no entregó un stream de audio utilizable (${problems.join(' · ')}). ` +
+      'Si esto pasa con todos los videos, actualiza youtubei.js y vuelve a compilar.',
+    'format',
   );
-}
-
-/**
- * Vuelve a pedir sólo la URL de stream. Las URLs de googlevideo caducan en
- * pocas horas, así que una descarga reanudada al día siguiente necesita una nueva.
- */
-export async function refreshStreamUrl(id: string): Promise<string> {
-  const resolved = await resolveTrack(id);
-  return resolved.streamUrl;
 }
 
 /** Búsqueda por texto, para no depender de tener el link a mano. */
@@ -201,24 +272,32 @@ export async function searchTracks(query: string, limit = 20): Promise<SearchRes
 
   let yt: Innertube;
   try {
-    yt = await getInnertube();
+    yt = await withTimeout(getInnertube(), 'session');
   } catch (err) {
     resetInnertube();
-    throw new ResolveError('No se pudo conectar con YouTube. Revisa tu conexión.', err);
+    if (err instanceof ResolveError) throw err;
+    throw new ResolveError('No se pudo conectar con YouTube. Revisa tu conexión.', 'session', err);
   }
 
   try {
-    const search = await yt.search(q, { type: 'video' });
+    const search = await withTimeout(yt.search(q, { type: 'video' }), 'metadata');
     const out: SearchResult[] = [];
 
     for (const item of search.results ?? []) {
-      const node = item as any;
-      const id: string | undefined = node.id ?? node.video_id;
-      if (!id || !/^[\w-]{11}$/.test(id)) continue;
+      const node = item as {
+        id?: string;
+        video_id?: string;
+        title?: { text?: string };
+        author?: { name?: string };
+        duration?: { seconds?: number };
+        thumbnails?: { url: string; width: number }[];
+      };
+      const videoId = node.id ?? node.video_id;
+      if (!videoId || !/^[\w-]{11}$/.test(videoId)) continue;
 
       out.push({
-        id,
-        title: node.title?.text ?? node.title?.toString?.() ?? 'Sin título',
+        id: videoId,
+        title: node.title?.text ?? 'Sin título',
         artist: cleanArtist(node.author?.name),
         duration: node.duration?.seconds ?? 0,
         thumbnailUrl: bestThumbnail(node.thumbnails),
@@ -228,6 +307,7 @@ export async function searchTracks(query: string, limit = 20): Promise<SearchRes
 
     return out;
   } catch (err) {
-    throw new ResolveError('La búsqueda falló. Intenta de nuevo.', err);
+    if (err instanceof ResolveError) throw err;
+    throw new ResolveError('La búsqueda falló. Intenta de nuevo.', 'metadata', err);
   }
 }
