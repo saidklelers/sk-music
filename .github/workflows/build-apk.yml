@@ -8,6 +8,10 @@ name: Build APK
 on:
   push:
     branches: [main]
+    # Un cambio solo de documentación no cambia el APK.
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
