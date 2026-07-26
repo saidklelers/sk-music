@@ -17,9 +17,29 @@ const fetchWithTimeout = async (
   init?: RequestInit,
 ): Promise<Response> => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+
+  const started = Date.now();
   try {
     return await fetch(input, { ...init, signal: controller.signal });
+  } catch (err) {
+    // Sin esto, RN reporta el aborto como "Fetch request has been canceled",
+    // que suena a que algo cancelo la descarga a proposito y esconde el dato
+    // util: que YouTube nunca respondio.
+    if (timedOut) {
+      const host = typeof input === 'string' ? new URL(input).host : 'YouTube';
+      throw new Error(
+        `${host} no respondio en ${REQUEST_TIMEOUT_MS / 1000} s (peticion abortada)`,
+      );
+    }
+    const ms = Date.now() - started;
+    throw new Error(
+      `${err instanceof Error ? err.message : 'fallo de red'} (tras ${ms} ms)`,
+    );
   } finally {
     clearTimeout(timer);
   }
