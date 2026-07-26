@@ -213,7 +213,9 @@ function JobRow({ job }: { job: DownloadJob }) {
         </Text>
 
         {job.status === 'error' ? (
-          <Text style={styles.jobError} numberOfLines={2}>
+          // Los mensajes de error son justo los que hay que poder leer
+          // completos, y son largos: 4 líneas y seleccionable para copiarlo.
+          <Text style={styles.jobError} numberOfLines={4} selectable>
             {job.error}
           </Text>
         ) : (
