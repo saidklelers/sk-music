@@ -38,6 +38,33 @@ const IOS_UA =
 type Preflight = { headers: Record<string, string>; status: number };
 
 /**
+ * Descarga de respaldo, escribiendo los bytes desde JavaScript.
+ *
+ * El descargador nativo usa OkHttp, con cabeceras por defecto distintas a las
+ * del `fetch` de React Native, así que puede ser rechazado por googlevideo
+ * aunque la comprobación previa haya pasado — que es justo el punto ciego de
+ * `preflight`. Esta vía usa exactamente el mismo cliente HTTP que sí funcionó.
+ *
+ * A cambio se pierde el progreso granular (`arrayBuffer()` es todo o nada) y el
+ * archivo pasa entero por memoria. Para pistas de audio de unos pocos MB es
+ * perfectamente asumible; por eso es el respaldo y no la vía principal.
+ */
+async function downloadViaFetch(
+  url: string,
+  headers: Record<string, string>,
+  dest: File,
+): Promise<void> {
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(`el servidor respondió HTTP ${res.status}`);
+
+  const buffer = await res.arrayBuffer();
+  if (buffer.byteLength === 0) throw new Error('el servidor devolvió un archivo vacío');
+
+  if (!dest.exists) dest.create({ intermediates: true });
+  dest.write(new Uint8Array(buffer));
+}
+
+/**
  * Comprueba que googlevideo acepte la URL antes de dársela al descargador
  * nativo.
  *
@@ -255,7 +282,24 @@ class DownloadManager {
         },
       });
 
-      await task.downloadAsync();
+      try {
+        await task.downloadAsync();
+      } catch (nativeErr) {
+        if (this.cancelled.has(id)) return;
+
+        // El descargador nativo falló pero la comprobación previa había pasado,
+        // así que la URL sirve y el problema está en cómo pide OkHttp. Se repite
+        // con el cliente HTTP de JS, que es el que ya demostró funcionar.
+        this.patch(id, { stage: 'Reintentando por otra vía…', progress: null });
+        try {
+          await downloadViaFetch(resolved.streamUrl, headers, dest);
+        } catch (fetchErr) {
+          const native = nativeErr instanceof Error ? nativeErr.message : 'error nativo';
+          const viaFetch = fetchErr instanceof Error ? fetchErr.message : 'error';
+          throw new Error(`Descarga nativa: ${native} — Reintento directo: ${viaFetch}`);
+        }
+        this.patch(id, { stage: null });
+      }
 
       if (this.cancelled.has(id)) {
         if (dest.exists) dest.delete();
