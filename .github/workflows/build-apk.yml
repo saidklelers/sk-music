@@ -39,6 +39,24 @@ jobs:
       - name: Instalar dependencias
         run: npm ci
 
+      - name: Sellar la versión con el número de build
+        # app.json tiene la versión fija en 1.0.0, así que todas las builds se
+        # veían igual dentro de la app y era imposible saber cuál estaba
+        # instalada. Se sella aquí para que Ajustes muestre la real.
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const build = process.env.BUILD_NUMBER;
+          const cfg = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+          cfg.expo.version = `1.0.${build}`;
+          cfg.expo.android = cfg.expo.android || {};
+          cfg.expo.android.versionCode = Number(build);
+          fs.writeFileSync('app.json', JSON.stringify(cfg, null, 2));
+          console.log('version sellada:', cfg.expo.version);
+          EOF
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+
       - name: Generar proyecto nativo
         # android/ está en .gitignore, así que se regenera en cada build a
         # partir de app.json y los config plugins.

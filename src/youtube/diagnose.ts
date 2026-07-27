@@ -1,3 +1,5 @@
+import Constants from 'expo-constants';
+
 import { getInnertube, resetInnertube } from './innertube';
 
 /**
@@ -35,6 +37,11 @@ const NET_PROBE_TIMEOUT_MS = 240_000;
 export async function diagnose(): Promise<string> {
   const out: string[] = [];
   const stamp = (start: number) => `${Date.now() - start} ms`;
+
+  // Encabeza con la versión: sin esto no hay forma de saber si un informe
+  // corresponde a la build que se acaba de instalar o a una anterior.
+  out.push(`SK Music ${Constants.expoConfig?.version ?? '?'}`);
+  out.push('');
 
   /* 1. Red. Con tope propio: sin él esta prueba llegó a tardar 4 minutos en
      frío, que era justo el dato que había que ver y no quedarse esperando. */
