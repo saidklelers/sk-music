@@ -22,6 +22,11 @@ export type DownloadJob = {
    * un fallo sea diagnosticable en vez de un "Resolviendo" eterno.
    */
   stage: string | null;
+  /**
+   * Estrategia de descarga que acabó funcionando. Se muestra al terminar para
+   * saber cuál sirvió sin tener que conectar el teléfono a un depurador.
+   */
+  via: string | null;
 };
 
 type Listener = () => void;
@@ -49,7 +54,35 @@ const IOS_UA =
  */
 const RANGE_HEADER = { Range: 'bytes=0-' };
 
-type Preflight = { headers: Record<string, string>; status: number };
+/** Una forma concreta de pedir el archivo, con su etiqueta para el informe. */
+type Strategy = { label: string; headers: Record<string, string> };
+
+/**
+ * Formas de pedir el audio, en orden de preferencia.
+ *
+ * Se probó en dispositivo que googlevideo acepta las cuatro combinaciones de
+ * rango y User-Agent sobre una URL recién obtenida (200 y 206 respectivamente),
+ * y aun así la descarga fallaba con 403. La diferencia estaba en que la
+ * comprobación previa y la descarga hacían peticiones DISTINTAS, de modo que el
+ * éxito de una no predecía nada sobre la otra.
+ *
+ * Se abandona esa separación: ahora se intenta la descarga de verdad con cada
+ * forma, en orden, y se usa la primera que funcione. La primera de la lista es
+ * exactamente la que el diagnóstico demostró que pasa.
+ */
+function strategies(sizeHint: number | null): Strategy[] {
+  const list: Strategy[] = [
+    { label: 'directo', headers: {} },
+    { label: 'directo + UA', headers: { 'User-Agent': IOS_UA } },
+    { label: 'rango abierto', headers: { ...RANGE_HEADER } },
+  ];
+  // Algunas URLs de googlevideo rechazan el rango abierto pero aceptan uno
+  // acotado, que es como descarga yt-dlp.
+  if (sizeHint && sizeHint > 0) {
+    list.push({ label: 'rango acotado', headers: { Range: `bytes=0-${sizeHint - 1}` } });
+  }
+  return list;
+}
 
 /**
  * Descarga de respaldo, escribiendo los bytes desde JavaScript.
@@ -67,56 +100,49 @@ async function downloadViaFetch(
   url: string,
   headers: Record<string, string>,
   dest: File,
-): Promise<void> {
-  const res = await fetch(url, { headers: { ...headers, ...RANGE_HEADER } });
+): Promise<number> {
+  const res = await fetch(url, { headers });
   // 206 (contenido parcial) es la respuesta esperada a una petición por rango.
   if (!res.ok && res.status !== 206) {
-    throw new Error(`el servidor respondió HTTP ${res.status}`);
+    throw new Error(`HTTP ${res.status}`);
   }
 
   const buffer = await res.arrayBuffer();
-  if (buffer.byteLength === 0) throw new Error('el servidor devolvió un archivo vacío');
+  if (buffer.byteLength === 0) throw new Error('archivo vacío');
 
-  if (!dest.exists) dest.create({ intermediates: true });
+  if (dest.exists) dest.delete();
+  dest.create({ intermediates: true });
   dest.write(new Uint8Array(buffer));
+  return buffer.byteLength;
 }
 
 /**
- * Comprueba que googlevideo acepte la URL antes de dársela al descargador
- * nativo.
+ * Descarga el audio probando cada estrategia hasta que una funcione.
  *
- * Existe por dos razones. La primera es diagnóstica: el módulo nativo envuelve
- * el fallo en "Unable to download a file: HTTP 403" y ese texto llega recortado
- * a la interfaz, así que el dato decisivo —el código de estado— se perdía.
- * La segunda es que permite corregir sobre la marcha: si el User-Agent de iOS
- * es rechazado, se reintenta sin él y se usa la variante que sí pasó.
- *
- * Se pide un solo byte con Range, así que cuesta prácticamente nada.
+ * Devuelve la etiqueta de la que sirvió, para poder saber cuál fue sin tener que
+ * conectar el teléfono a un depurador. Si fallan todas, el error enumera qué
+ * respondió cada una: es la única forma de distinguir "YouTube rechaza todo" de
+ * "YouTube rechaza esta forma concreta de pedirlo".
  */
-async function preflight(url: string): Promise<Preflight> {
-  const variants: Record<string, string>[] = [{ 'User-Agent': IOS_UA }, {}];
-  let lastStatus = 0;
+async function downloadAudio(
+  url: string,
+  dest: File,
+  sizeHint: number | null,
+  onAttempt: (label: string) => void,
+): Promise<string> {
+  const failures: string[] = [];
 
-  for (const headers of variants) {
+  for (const { label, headers } of strategies(sizeHint)) {
+    onAttempt(label);
     try {
-      const res = await fetch(url, {
-        method: 'GET',
-        headers: { ...headers, Range: 'bytes=0-0' },
-      });
-      // 206 es lo esperado con Range; 200 significa que lo ignoró y sirve igual.
-      if (res.ok || res.status === 206) return { headers, status: res.status };
-      lastStatus = res.status;
-    } catch {
-      lastStatus = -1;
+      await downloadViaFetch(url, headers, dest);
+      return label;
+    } catch (err) {
+      failures.push(`${label}: ${err instanceof Error ? err.message : 'error'}`);
     }
   }
 
-  throw new Error(
-    lastStatus === -1
-      ? 'No se pudo contactar el servidor de audio de YouTube.'
-      : `El servidor de audio rechazó la descarga (HTTP ${lastStatus}). ` +
-        'La URL caducó o YouTube la bloqueó; toca reintentar.',
-  );
+  throw new Error(`Ninguna vía funcionó — ${failures.join(' · ')}`);
 }
 
 /**
@@ -194,6 +220,7 @@ class DownloadManager {
       progress: null,
       error: null,
       stage: null,
+      via: null,
       // `idOrUrl` se conserva aparte porque puede ser una URL completa.
     });
     this.pendingInput.set(id, idOrUrl);
@@ -276,47 +303,19 @@ class DownloadManager {
       const dest = trackFile(fileName);
       if (dest.exists) dest.delete(); // reintento limpio
 
-      // Comprueba la URL y averigua qué cabeceras acepta antes de entregarla al
-      // descargador nativo, cuyo error llega envuelto y recortado.
-      this.patch(id, { stage: 'Comprobando el enlace…' });
-      const { headers } = await preflight(resolved.streamUrl);
-      if (this.cancelled.has(id)) return;
-      this.patch(id, { stage: null });
-
-      const task = File.createDownloadTask(resolved.streamUrl, dest, {
-        // Sólo tiene efecto en iOS, donde usa URLSessionConfiguration.background
-        // y la descarga sobrevive incluso al cierre de la app. En Android el
-        // módulo ignora este campo y hace una llamada OkHttp dentro del proceso.
-        sessionType: 'background',
-        headers: { ...headers, ...RANGE_HEADER },
-        onProgress: ({ bytesWritten, totalBytes }) => {
-          if (this.cancelled.has(id)) {
-            task.cancel();
-            return;
-          }
-          const total = totalBytes || resolved.approxBytes || 0;
-          this.patch(id, { progress: total > 0 ? Math.min(bytesWritten / total, 1) : null });
-        },
-      });
-
-      try {
-        await task.downloadAsync();
-      } catch (nativeErr) {
-        if (this.cancelled.has(id)) return;
-
-        // El descargador nativo falló pero la comprobación previa había pasado,
-        // así que la URL sirve y el problema está en cómo pide OkHttp. Se repite
-        // con el cliente HTTP de JS, que es el que ya demostró funcionar.
-        this.patch(id, { stage: 'Reintentando por otra vía…', progress: null });
-        try {
-          await downloadViaFetch(resolved.streamUrl, headers, dest);
-        } catch (fetchErr) {
-          const native = nativeErr instanceof Error ? nativeErr.message : 'error nativo';
-          const viaFetch = fetchErr instanceof Error ? fetchErr.message : 'error';
-          throw new Error(`Descarga nativa: ${native} — Reintento directo: ${viaFetch}`);
-        }
-        this.patch(id, { stage: null });
-      }
+      // Se descarga con `fetch`, no con el descargador nativo, porque es el
+      // cliente HTTP que el diagnóstico demostró que googlevideo acepta y
+      // porque permite controlar las cabeceras exactas de cada intento. El
+      // precio es perder el progreso granular: `arrayBuffer()` es todo o nada,
+      // así que la barra queda indeterminada.
+      this.patch(id, { progress: null });
+      const winner = await downloadAudio(
+        resolved.streamUrl,
+        dest,
+        resolved.approxBytes,
+        (label) => this.patch(id, { stage: `Descargando (${label})…` }),
+      );
+      this.patch(id, { stage: null, progress: 1, via: winner });
 
       if (this.cancelled.has(id)) {
         if (dest.exists) dest.delete();

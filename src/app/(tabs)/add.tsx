@@ -242,7 +242,7 @@ function JobRow({
           <Text style={styles.jobStatus} numberOfLines={1}>
             {job.status === 'resolving' && (job.stage ?? 'Resolviendo…')}
             {job.status === 'downloading' && (pct != null ? `${pct} %` : 'Descargando…')}
-            {job.status === 'done' && 'Listo'}
+            {job.status === 'done' && (job.via ? `Listo · vía ${job.via}` : 'Listo')}
             {job.status === 'cancelled' && 'Cancelada'}
           </Text>
         )}
