@@ -1,6 +1,6 @@
 import type { Innertube } from 'youtubei.js';
 
-import { getInnertube, resetInnertube } from './innertube';
+import { getInnertube, isCold, resetInnertube } from './innertube';
 
 /** Etapas de la resolución, para poder mostrar en qué punto va o dónde falló. */
 export type ResolveStage = 'session' | 'metadata' | 'format';
@@ -10,6 +10,18 @@ export const STAGE_LABEL: Record<ResolveStage, string> = {
   metadata: 'Leyendo el video…',
   format: 'Buscando el audio…',
 };
+
+/**
+ * Etiqueta para la UI. En frío avisa explícitamente de que puede tardar: una
+ * espera larga sin explicación se lee como app colgada, y el usuario cierra la
+ * app justo antes de que la conexión llegue a establecerse.
+ */
+export function stageLabel(stage: ResolveStage): string {
+  if (stage === 'session' && isCold()) {
+    return 'Primera conexión, puede tardar…';
+  }
+  return STAGE_LABEL[stage];
+}
 
 /** Metadatos + URL de audio lista para descargar. */
 export type ResolvedTrack = {
@@ -48,8 +60,21 @@ export type SearchResult = {
  */
 const CLIENTS = ['IOS', 'ANDROID'] as const;
 
-/** Tope por etapa. Evita que la UI se quede colgada sin decir nada. */
-const STAGE_TIMEOUT_MS = 25_000;
+/**
+ * Tope por etapa. Es una red de seguridad para que la UI nunca quede colgada en
+ * silencio, NO el mecanismo principal de tiempo — ese vive en innertube.ts.
+ *
+ * Tiene que ser holgadamente mayor que el presupuesto de red de la etapa. Antes
+ * estaba fijo en 25 s mientras el fetch podía tardar hasta 135 s entre
+ * reintentos: el reloj corto anulaba al largo y los reintentos jamás llegaban a
+ * ejecutarse. Dos temporizadores en serie tienen que ordenarse, no competir.
+ */
+const COLD_STAGE_TIMEOUT_MS = 270_000; // > COLD_TIMEOUT_MS (240 s)
+const WARM_STAGE_TIMEOUT_MS = 120_000; // > 3 intentos de 30 s + esperas
+
+function stageTimeoutMs() {
+  return isCold() ? COLD_STAGE_TIMEOUT_MS : WARM_STAGE_TIMEOUT_MS;
+}
 
 /** Error con mensaje ya listo para mostrarle al usuario. */
 export class ResolveError extends Error {
@@ -72,16 +97,18 @@ export class ResolveError extends Error {
  * `retrieve_player: false` en innertube.ts.
  */
 function withTimeout<T>(promise: Promise<T>, stage: ResolveStage): Promise<T> {
+  const budget = stageTimeoutMs();
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(
         new ResolveError(
-          `Se agotó el tiempo de espera (${STAGE_LABEL[stage].replace('…', '').toLowerCase()}). ` +
+          `Se agotó el tiempo de espera tras ${Math.round(budget / 1000)} s ` +
+            `(${STAGE_LABEL[stage].replace('…', '').toLowerCase()}). ` +
             'Revisa tu conexión e intenta de nuevo.',
           stage,
         ),
       );
-    }, STAGE_TIMEOUT_MS);
+    }, budget);
 
     promise.then(
       (value) => {

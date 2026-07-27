@@ -1,7 +1,7 @@
 import { File } from 'expo-file-system';
 
 import type { Track } from '@/db';
-import { resolveTrack, STAGE_LABEL, type ResolvedTrack } from '@/youtube/resolve';
+import { resolveTrack, stageLabel, type ResolvedTrack } from '@/youtube/resolve';
 
 import { artworkFile, ensureDirs, trackFile } from './storage';
 
@@ -165,7 +165,7 @@ class DownloadManager {
       /* 1. Resolver metadatos + URL de stream. */
       this.patch(id, { status: 'resolving', progress: null, stage: null });
       const resolved = await resolveTrack(input, (stage) =>
-        this.patch(id, { stage: STAGE_LABEL[stage] }),
+        this.patch(id, { stage: stageLabel(stage) }),
       );
       if (this.cancelled.has(id)) return;
 
@@ -184,6 +184,11 @@ class DownloadManager {
       if (dest.exists) dest.delete(); // reintento limpio
 
       const task = File.createDownloadTask(resolved.streamUrl, dest, {
+        // En iOS esto usa URLSessionConfiguration.background: la descarga
+        // sobrevive a que la app pase a segundo plano e incluso a que se cierre.
+        // En Android el módulo hace una llamada OkHttp dentro del proceso, así
+        // que sigue mientras el sistema no lo mate — ver README.
+        sessionType: 'background',
         headers: {
           // googlevideo responde 403 a peticiones sin UA reconocible.
           'User-Agent':

@@ -114,7 +114,11 @@ Requiere cuenta de Expo y cuenta de Apple. Con cuenta de Apple gratuita la app *
 
 - **La pantalla bloqueada no tiene botones de siguiente/anterior.** `expo-audio` solo expone play/pausa y adelantar/retroceder dentro de la canción. Para cambiar de pista hay que abrir la app.
 - **Las descargas se rompen cuando YouTube cambia algo.** Es el costo de no tener servidor. La cura suele ser `npm update youtubei.js` y recompilar. En Ajustes hay un botón para reiniciar la sesión por si es algo transitorio.
-- **Optimización de batería en Android.** Algunos fabricantes (Xiaomi, Samsung, Oppo, Huawei) matan servicios en primer plano de forma agresiva. Si el audio se corta al bloquear la pantalla, hay que excluir la app en los ajustes de batería del teléfono.
+- **Descargas en segundo plano: completas en iOS, parciales en Android.** iOS usa `URLSessionConfiguration.background`, así que la descarga sigue aunque cierres la app. En Android `expo-file-system` hace la petición dentro del proceso, sin `WorkManager` ni servicio en primer plano: continúa mientras el sistema mantenga vivo el proceso, pero puede morir si el teléfono lo recicla. Hacerlo robusto exige un servicio nativo dedicado.
+
+- **Optimización de batería en Android.** Algunos fabricantes (Xiaomi, Samsung, Oppo, Huawei) matan procesos en segundo plano de forma agresiva y llegan a estrangular la red de las apps no exceptuadas. Si el audio se corta al bloquear la pantalla, si las descargas mueren al salir de la app, o si la primera conexión a YouTube tarda minutos, lo primero que hay que probar es excluir la app en los ajustes de batería del teléfono.
+
+- **La primera conexión puede tardar.** En algunas redes la conexión inicial a YouTube tarda minutos (DNS o IPv6 agotando su propio tiempo antes de caer a IPv4) mientras que las siguientes tardan milisegundos. La app la va calentando al abrirse para que ese coste no caiga sobre la primera descarga.
 - **Videos con restricción de edad** no se pueden descargar.
 
 ## Nota legal

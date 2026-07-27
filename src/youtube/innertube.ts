@@ -3,19 +3,38 @@ import '@/lib/polyfills'; // debe ir primero: youtubei.js lee globals al importa
 import { Innertube } from 'youtubei.js';
 
 /**
- * Tope por intento.
+ * Tiempos de espera, medidos contra el comportamiento real del dispositivo.
  *
- * 45 s y no 20 porque el arranque en frío puede ser brutal: en pruebas reales
- * la primera conexión a youtube.com tardó más de 4 minutos (DNS o IPv6
- * colgándose antes de caer a IPv4) mientras que todas las siguientes tardaron
- * ~400 ms. No sirve subir el tope hasta cubrir ese peor caso —serían minutos de
- * app congelada— así que la solución real es el reintento de abajo: al segundo
- * intento la conexión ya está caliente y responde al instante.
+ * El dato que manda: la PRIMERA conexión a youtube.com tardó 252 s en
+ * completarse, y a partir de ahí todas las demás tardaron ~400 ms. Es el patrón
+ * típico de DNS o IPv6 colgándose hasta agotar su propio tope antes de caer a
+ * IPv4.
+ *
+ * De ahí salen dos reglas:
+ *
+ * 1. En frío hay que tener MUCHA paciencia. Cortar a los 45 s no "protegía"
+ *    nada: condenaba al fallo una conexión que sí iba a establecerse.
+ * 2. En frío NO hay que reintentar. Abortar mata la resolución DNS en curso y
+ *    el reintento arranca de cero, así que reintentar empeora el caso en vez de
+ *    mejorarlo. El reintento sólo sirve una vez la conexión está caliente, que
+ *    es cuando un fallo sí es transitorio.
  */
-const REQUEST_TIMEOUT_MS = 45_000;
+const COLD_TIMEOUT_MS = 240_000; // 4 min, sólo hasta la primera respuesta
+const WARM_TIMEOUT_MS = 30_000;
 
-/** Reintentos ante fallo o vencimiento. Las llamadas a InnerTube son lecturas. */
-const MAX_RETRIES = 2;
+/** Reintentos en caliente. Las llamadas a InnerTube son lecturas idempotentes. */
+const WARM_RETRIES = 2;
+
+/**
+ * Se pone en true con la primera respuesta que llegue de YouTube. A partir de
+ * ahí la conexión está establecida y los tiempos largos dejan de tener sentido.
+ */
+let hasConnected = false;
+
+/** true mientras no se haya conseguido ninguna respuesta todavía. */
+export function isCold() {
+  return !hasConnected;
+}
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -28,31 +47,33 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
  */
 const fetchWithTimeout = async (
   input: RequestInfo | URL,
-  init?: RequestInit,
+  init: RequestInit | undefined,
+  timeoutMs: number,
 ): Promise<Response> => {
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, REQUEST_TIMEOUT_MS);
+  }, timeoutMs);
 
   const started = Date.now();
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const res = await fetch(input, { ...init, signal: controller.signal });
+    // Primera respuesta: la conexión quedó establecida y a partir de aquí los
+    // tiempos largos ya no aplican.
+    hasConnected = true;
+    return res;
   } catch (err) {
     // Sin esto, RN reporta el aborto como "Fetch request has been canceled",
-    // que suena a que algo cancelo la descarga a proposito y esconde el dato
-    // util: que YouTube nunca respondio.
+    // que suena a una cancelación deliberada y esconde el dato útil: que el
+    // servidor nunca respondió.
     if (timedOut) {
       const host = typeof input === 'string' ? new URL(input).host : 'YouTube';
-      throw new Error(
-        `${host} no respondio en ${REQUEST_TIMEOUT_MS / 1000} s (peticion abortada)`,
-      );
+      throw new Error(`${host} no respondió en ${Math.round(timeoutMs / 1000)} s`);
     }
-    const ms = Date.now() - started;
     throw new Error(
-      `${err instanceof Error ? err.message : 'fallo de red'} (tras ${ms} ms)`,
+      `${err instanceof Error ? err.message : 'fallo de red'} (tras ${Date.now() - started} ms)`,
     );
   } finally {
     clearTimeout(timer);
@@ -60,28 +81,31 @@ const fetchWithTimeout = async (
 };
 
 /**
- * Reintenta ante vencimiento o fallo de red.
+ * `fetch` de la sesión: paciente en frío, rápido y con reintentos en caliente.
  *
- * Es la pieza que de verdad resuelve el arranque en frío: si el primer intento
- * se queda esperando a que resuelva el DNS, el timeout lo corta y el segundo
- * sale por una conexión ya establecida. Sólo se reintenta el transporte —un 400
- * o un 403 de YouTube se propaga tal cual, porque reintentarlo no cambia nada.
+ * La asimetría es deliberada. Mientras no haya habido ninguna respuesta se hace
+ * UN solo intento con un tope muy alto, porque abortar cancelaría la resolución
+ * DNS en curso y el reintento volvería a empezar de cero — reintentar en frío
+ * hace daño. Ya con la conexión establecida, un fallo sí suele ser transitorio
+ * y ahí los reintentos rápidos valen la pena.
  */
-const fetchWithRetry = async (
+const sessionFetch = async (
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> => {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await fetchWithTimeout(input, init);
-    } catch (err) {
-      lastError = err;
-      if (attempt < MAX_RETRIES) await delay(400 * 2 ** attempt);
-    }
+  if (isCold()) {
+    return fetchWithTimeout(input, init, COLD_TIMEOUT_MS);
   }
 
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= WARM_RETRIES; attempt++) {
+    try {
+      return await fetchWithTimeout(input, init, WARM_TIMEOUT_MS);
+    } catch (err) {
+      lastError = err;
+      if (attempt < WARM_RETRIES) await delay(400 * 2 ** attempt);
+    }
+  }
   throw lastError;
 };
 
@@ -109,7 +133,7 @@ export function getInnertube(): Promise<Innertube> {
       retrieve_player: false,
       generate_session_locally: true,
       enable_session_cache: false,
-      fetch: fetchWithRetry,
+      fetch: sessionFetch,
     }).catch((err) => {
       pending = null;
       throw err;

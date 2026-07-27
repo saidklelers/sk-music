@@ -8,8 +8,14 @@ const PROBE_ID = 'dQw4w9WgXcQ';
 
 const CLIENTS = ['IOS', 'ANDROID'] as const;
 
-/** Tope de la prueba de red. Sin esto puede quedarse minutos y no se ve. */
-const NET_PROBE_TIMEOUT_MS = 45_000;
+/**
+ * Tope de la prueba de red.
+ *
+ * Alto a propósito: en este dispositivo la primera conexión llegó a tardar 252 s
+ * y sí completaba. Con 45 s el diagnóstico reportaba "sin salida a internet",
+ * que era un falso negativo — había internet, sólo tardaba una barbaridad.
+ */
+const NET_PROBE_TIMEOUT_MS = 240_000;
 
 /**
  * Prueba la cadena de resolución paso a paso y devuelve un informe legible.
