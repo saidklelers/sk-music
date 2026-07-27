@@ -35,6 +35,20 @@ type Listener = () => void;
 const IOS_UA =
   'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
 
+/**
+ * Cabecera imprescindible: sin ella googlevideo responde 403.
+ *
+ * Se descubrió comparando dos peticiones a la MISMA URL: la comprobación previa,
+ * que pedía `bytes=0-0`, pasaba sin problema, mientras que la descarga real —que
+ * pedía el archivo entero sin `Range`— recibía 403 por las dos vías, nativa y
+ * por fetch. Es el comportamiento habitual de las URLs de formato adaptativo
+ * cuando quien las pide no es un navegador: exigen una petición por rango.
+ *
+ * `bytes=0-` pide desde el primer byte hasta el final, así que se descarga el
+ * archivo completo en una sola respuesta 206.
+ */
+const RANGE_HEADER = { Range: 'bytes=0-' };
+
 type Preflight = { headers: Record<string, string>; status: number };
 
 /**
@@ -54,8 +68,11 @@ async function downloadViaFetch(
   headers: Record<string, string>,
   dest: File,
 ): Promise<void> {
-  const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error(`el servidor respondió HTTP ${res.status}`);
+  const res = await fetch(url, { headers: { ...headers, ...RANGE_HEADER } });
+  // 206 (contenido parcial) es la respuesta esperada a una petición por rango.
+  if (!res.ok && res.status !== 206) {
+    throw new Error(`el servidor respondió HTTP ${res.status}`);
+  }
 
   const buffer = await res.arrayBuffer();
   if (buffer.byteLength === 0) throw new Error('el servidor devolvió un archivo vacío');
@@ -271,7 +288,7 @@ class DownloadManager {
         // y la descarga sobrevive incluso al cierre de la app. En Android el
         // módulo ignora este campo y hace una llamada OkHttp dentro del proceso.
         sessionType: 'background',
-        headers,
+        headers: { ...headers, ...RANGE_HEADER },
         onProgress: ({ bytesWritten, totalBytes }) => {
           if (this.cancelled.has(id)) {
             task.cancel();

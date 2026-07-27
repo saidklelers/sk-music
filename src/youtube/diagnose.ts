@@ -12,6 +12,9 @@ const CLIENTS = ['IOS', 'ANDROID'] as const;
 const IOS_UA =
   'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
 
+/** Un solo byte: basta para saber si el servidor acepta la petición. */
+const RANGE = { Range: 'bytes=0-0' };
+
 /**
  * Tope de la prueba de red.
  *
@@ -87,24 +90,23 @@ export async function diagnose(): Promise<string> {
         const mb = fmt.content_length ? (fmt.content_length / 1048576).toFixed(1) : '?';
         out.push(`${client}: OK — audio de ${mb} MB (${stamp(tCli)})`);
 
-        // Tener una URL no significa que googlevideo la vaya a servir: puede
-        // responder 403 por caducidad, IP o cabeceras. Se pide un byte para
-        // saberlo aquí en vez de descubrirlo a mitad de descarga.
+        // Tener una URL no significa que googlevideo la vaya a servir. Se
+        // prueban las cuatro combinaciones porque las dos dimensiones importan
+        // por separado: sin `Range` el servidor responde 403 aunque todo lo
+        // demás esté bien, y eso sólo se ve comparando.
         for (const [label, headers] of [
-          ['con UA de iOS', { 'User-Agent': IOS_UA }],
-          ['sin UA', {}],
+          ['con rango + UA', { ...RANGE, 'User-Agent': IOS_UA }],
+          ['con rango, sin UA', { ...RANGE }],
+          ['sin rango, con UA', { 'User-Agent': IOS_UA }],
+          ['sin rango ni UA', {}],
         ] as [string, Record<string, string>][]) {
           const tDl = Date.now();
           try {
-            const probe = await fetch(fmt.url, {
-              method: 'GET',
-              headers: { ...headers, Range: 'bytes=0-0' },
-            });
-            out.push(`   descarga ${label}: HTTP ${probe.status} (${stamp(tDl)})`);
+            const probe = await fetch(fmt.url, { method: 'GET', headers });
+            const verdict = probe.ok || probe.status === 206 ? 'OK' : 'RECHAZADO';
+            out.push(`   ${label}: HTTP ${probe.status} ${verdict} (${stamp(tDl)})`);
           } catch (err) {
-            out.push(
-              `   descarga ${label}: FALLA — ${err instanceof Error ? err.message : 'error'}`,
-            );
+            out.push(`   ${label}: FALLA — ${err instanceof Error ? err.message : 'error'}`);
           }
         }
       }
