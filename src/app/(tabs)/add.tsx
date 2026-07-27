@@ -15,6 +15,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Artwork } from '@/components/Artwork';
 import { Check, Download, Link, Search, X } from '@/components/Icons';
 import { Button, ScreenHeader, SectionLabel } from '@/components/Primitives';
+import { Sheet } from '@/components/Sheet';
 import { downloads, type DownloadJob } from '@/downloads/manager';
 import { useLibrary } from '@/library/LibraryProvider';
 import { formatDuration } from '@/lib/format';
@@ -29,6 +30,7 @@ export default function AddScreen() {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
 
   // Un link se descarga directo; cualquier otra cosa se trata como búsqueda.
   const looksLikeLink = !!parseVideoId(input);
@@ -119,7 +121,7 @@ export default function AddScreen() {
               <>
                 <SectionLabel>Descargando</SectionLabel>
                 {activeJobs.map((job) => (
-                  <JobRow key={job.id} job={job} />
+                  <JobRow key={job.id} job={job} onShowError={setErrorDetail} />
                 ))}
               </>
             )}
@@ -133,7 +135,7 @@ export default function AddScreen() {
                   </Pressable>
                 </View>
                 {finishedJobs.map((job) => (
-                  <JobRow key={job.id} job={job} />
+                  <JobRow key={job.id} job={job} onShowError={setErrorDetail} />
                 ))}
               </>
             )}
@@ -194,12 +196,27 @@ export default function AddScreen() {
           ) : null
         }
       />
+
+      <Sheet
+        visible={!!errorDetail}
+        onClose={() => setErrorDetail(null)}
+        title="Detalle del error">
+        <Text style={styles.errorDetail} selectable>
+          {errorDetail}
+        </Text>
+      </Sheet>
     </KeyboardAvoidingView>
   );
 }
 
 /** Tarjeta de una descarga en curso o terminada. */
-function JobRow({ job }: { job: DownloadJob }) {
+function JobRow({
+  job,
+  onShowError,
+}: {
+  job: DownloadJob;
+  onShowError: (message: string) => void;
+}) {
   const pct = job.progress != null ? Math.round(job.progress * 100) : null;
   const active = job.status === 'resolving' || job.status === 'downloading';
 
@@ -213,11 +230,14 @@ function JobRow({ job }: { job: DownloadJob }) {
         </Text>
 
         {job.status === 'error' ? (
-          // Los mensajes de error son justo los que hay que poder leer
-          // completos, y son largos: 4 líneas y seleccionable para copiarlo.
-          <Text style={styles.jobError} numberOfLines={4} selectable>
-            {job.error}
-          </Text>
+          // Cuatro líneas siguen sin bastar para los errores nativos, que vienen
+          // envueltos y son largos. Se toca para verlo entero.
+          <Pressable onPress={() => onShowError(job.error ?? '')}>
+            <Text style={styles.jobError} numberOfLines={4}>
+              {job.error}
+            </Text>
+            <Text style={styles.jobErrorMore}>Toca para ver el error completo</Text>
+          </Pressable>
         ) : (
           <Text style={styles.jobStatus} numberOfLines={1}>
             {job.status === 'resolving' && (job.stage ?? 'Resolviendo…')}
@@ -306,6 +326,15 @@ const styles = StyleSheet.create({
   jobTitle: { ...type.body, color: colors.text },
   jobStatus: { ...type.small, color: colors.textMuted },
   jobError: { ...type.small, color: colors.danger, lineHeight: 17 },
+  jobErrorMore: { ...type.small, color: colors.textFaint, fontSize: 11, marginTop: 3 },
+  errorDetail: {
+    color: colors.textMuted,
+    fontSize: 12,
+    lineHeight: 19,
+    paddingHorizontal: space.lg,
+    paddingBottom: space.lg,
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
+  },
   jobTrack: {
     height: 3,
     backgroundColor: colors.border,

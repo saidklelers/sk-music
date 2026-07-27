@@ -27,6 +27,55 @@ export type DownloadJob = {
 type Listener = () => void;
 
 /**
+ * Cabecera de cliente iOS de YouTube. Las URLs de googlevideo obtenidas con el
+ * cliente IOS a veces exigen que el User-Agent coincida, y a veces rechazan uno
+ * que no reconocen. Como no se puede saber de antemano cuál es el caso, se
+ * prueban ambas variantes.
+ */
+const IOS_UA =
+  'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
+
+type Preflight = { headers: Record<string, string>; status: number };
+
+/**
+ * Comprueba que googlevideo acepte la URL antes de dársela al descargador
+ * nativo.
+ *
+ * Existe por dos razones. La primera es diagnóstica: el módulo nativo envuelve
+ * el fallo en "Unable to download a file: HTTP 403" y ese texto llega recortado
+ * a la interfaz, así que el dato decisivo —el código de estado— se perdía.
+ * La segunda es que permite corregir sobre la marcha: si el User-Agent de iOS
+ * es rechazado, se reintenta sin él y se usa la variante que sí pasó.
+ *
+ * Se pide un solo byte con Range, así que cuesta prácticamente nada.
+ */
+async function preflight(url: string): Promise<Preflight> {
+  const variants: Record<string, string>[] = [{ 'User-Agent': IOS_UA }, {}];
+  let lastStatus = 0;
+
+  for (const headers of variants) {
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: { ...headers, Range: 'bytes=0-0' },
+      });
+      // 206 es lo esperado con Range; 200 significa que lo ignoró y sirve igual.
+      if (res.ok || res.status === 206) return { headers, status: res.status };
+      lastStatus = res.status;
+    } catch {
+      lastStatus = -1;
+    }
+  }
+
+  throw new Error(
+    lastStatus === -1
+      ? 'No se pudo contactar el servidor de audio de YouTube.'
+      : `El servidor de audio rechazó la descarga (HTTP ${lastStatus}). ` +
+        'La URL caducó o YouTube la bloqueó; toca reintentar.',
+  );
+}
+
+/**
  * Cola de descargas.
  *
  * Es un singleton fuera de React: las descargas tienen que sobrevivir a que se
@@ -183,17 +232,19 @@ class DownloadManager {
       const dest = trackFile(fileName);
       if (dest.exists) dest.delete(); // reintento limpio
 
+      // Comprueba la URL y averigua qué cabeceras acepta antes de entregarla al
+      // descargador nativo, cuyo error llega envuelto y recortado.
+      this.patch(id, { stage: 'Comprobando el enlace…' });
+      const { headers } = await preflight(resolved.streamUrl);
+      if (this.cancelled.has(id)) return;
+      this.patch(id, { stage: null });
+
       const task = File.createDownloadTask(resolved.streamUrl, dest, {
-        // En iOS esto usa URLSessionConfiguration.background: la descarga
-        // sobrevive a que la app pase a segundo plano e incluso a que se cierre.
-        // En Android el módulo hace una llamada OkHttp dentro del proceso, así
-        // que sigue mientras el sistema no lo mate — ver README.
+        // Sólo tiene efecto en iOS, donde usa URLSessionConfiguration.background
+        // y la descarga sobrevive incluso al cierre de la app. En Android el
+        // módulo ignora este campo y hace una llamada OkHttp dentro del proceso.
         sessionType: 'background',
-        headers: {
-          // googlevideo responde 403 a peticiones sin UA reconocible.
-          'User-Agent':
-            'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)',
-        },
+        headers,
         onProgress: ({ bytesWritten, totalBytes }) => {
           if (this.cancelled.has(id)) {
             task.cancel();

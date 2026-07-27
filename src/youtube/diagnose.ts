@@ -8,6 +8,10 @@ const PROBE_ID = 'dQw4w9WgXcQ';
 
 const CLIENTS = ['IOS', 'ANDROID'] as const;
 
+/** Mismo UA que usa el gestor de descargas, para que la prueba sea equivalente. */
+const IOS_UA =
+  'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
+
 /**
  * Tope de la prueba de red.
  *
@@ -82,6 +86,27 @@ export async function diagnose(): Promise<string> {
       } else {
         const mb = fmt.content_length ? (fmt.content_length / 1048576).toFixed(1) : '?';
         out.push(`${client}: OK — audio de ${mb} MB (${stamp(tCli)})`);
+
+        // Tener una URL no significa que googlevideo la vaya a servir: puede
+        // responder 403 por caducidad, IP o cabeceras. Se pide un byte para
+        // saberlo aquí en vez de descubrirlo a mitad de descarga.
+        for (const [label, headers] of [
+          ['con UA de iOS', { 'User-Agent': IOS_UA }],
+          ['sin UA', {}],
+        ] as [string, Record<string, string>][]) {
+          const tDl = Date.now();
+          try {
+            const probe = await fetch(fmt.url, {
+              method: 'GET',
+              headers: { ...headers, Range: 'bytes=0-0' },
+            });
+            out.push(`   descarga ${label}: HTTP ${probe.status} (${stamp(tDl)})`);
+          } catch (err) {
+            out.push(
+              `   descarga ${label}: FALLA — ${err instanceof Error ? err.message : 'error'}`,
+            );
+          }
+        }
       }
     } catch (err) {
       out.push(`${client}: FALLA — ${err instanceof Error ? err.message : 'error'} (${stamp(tCli)})`);
