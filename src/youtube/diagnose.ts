@@ -14,8 +14,6 @@ const CLIENTS = ['IOS', 'ANDROID'] as const;
 const IOS_UA =
   'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
 
-/** Un solo byte: basta para saber si el servidor acepta la petición. */
-const RANGE = { Range: 'bytes=0-0' };
 
 /**
  * Tope de la prueba de red.
@@ -142,24 +140,43 @@ export async function diagnose(videoId?: string): Promise<string> {
         // que no; sin esto sólo se ve el 403 sin saber por qué.
         out.push(...describeUrl(fmt.url));
 
-        // Tener una URL no significa que googlevideo la vaya a servir. Se
-        // prueban las cuatro combinaciones porque las dos dimensiones importan
-        // por separado: sin `Range` el servidor responde 403 aunque todo lo
-        // demás esté bien, y eso sólo se ve comparando.
-        for (const [label, headers] of [
-          ['con rango + UA', { ...RANGE, 'User-Agent': IOS_UA }],
-          ['con rango, sin UA', { ...RANGE }],
-          ['sin rango, con UA', { 'User-Agent': IOS_UA }],
-          ['sin rango ni UA', {}],
-        ] as [string, Record<string, string>][]) {
+        // Lo decisivo no es SI la petición lleva rango, sino CUÁNTO pide: se
+        // midió que un byte pasa y el archivo entero se rechaza. Se prueba una
+        // escala de tamaños para ver dónde está el umbral exacto, que es lo que
+        // determina el tamaño de trozo que usa la descarga.
+        const sizes: [string, string][] = [
+          ['1 byte', 'bytes=0-0'],
+          ['64 KiB', 'bytes=0-65535'],
+          ['1 MiB', 'bytes=0-1048575'],
+          ['4 MiB', 'bytes=0-4194303'],
+        ];
+        if (fmt.content_length) {
+          sizes.push(['archivo entero', `bytes=0-${fmt.content_length - 1}`]);
+        }
+
+        for (const [label, range] of sizes) {
           const tDl = Date.now();
           try {
-            const probe = await fetch(fmt.url, { method: 'GET', headers });
-            const verdict = probe.ok || probe.status === 206 ? 'OK' : 'RECHAZADO';
+            const probe = await fetch(fmt.url, {
+              method: 'GET',
+              headers: { Range: range, 'User-Agent': IOS_UA },
+            });
+            const verdict = probe.status === 206 || probe.ok ? 'OK' : 'RECHAZADO';
             out.push(`   ${label}: HTTP ${probe.status} ${verdict} (${stamp(tDl)})`);
           } catch (err) {
             out.push(`   ${label}: FALLA — ${err instanceof Error ? err.message : 'error'}`);
           }
+        }
+
+        // Sin rango, para conservar la comparación que reveló el patrón.
+        const tPlain = Date.now();
+        try {
+          const probe = await fetch(fmt.url, { method: 'GET' });
+          out.push(
+            `   sin rango: HTTP ${probe.status} ${probe.ok ? 'OK' : 'RECHAZADO'} (${stamp(tPlain)})`,
+          );
+        } catch (err) {
+          out.push(`   sin rango: FALLA — ${err instanceof Error ? err.message : 'error'}`);
         }
       }
     } catch (err) {

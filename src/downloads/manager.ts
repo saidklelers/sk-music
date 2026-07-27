@@ -41,133 +41,135 @@ const IOS_UA =
   'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)';
 
 /**
- * Cabecera imprescindible: sin ella googlevideo responde 403.
+ * Tamaño de trozo para la descarga.
  *
- * Se descubrió comparando dos peticiones a la MISMA URL: la comprobación previa,
- * que pedía `bytes=0-0`, pasaba sin problema, mientras que la descarga real —que
- * pedía el archivo entero sin `Range`— recibía 403 por las dos vías, nativa y
- * por fetch. Es el comportamiento habitual de las URLs de formato adaptativo
- * cuando quien las pide no es un navegador: exigen una petición por rango.
+ * googlevideo no rechaza por *si* la petición lleva `Range`, sino por CUÁNTO
+ * pide. Medido en dispositivo sobre el mismo video con tres minutos de
+ * diferencia: `bytes=0-0` (un byte) devuelve 206, mientras que pedir el archivo
+ * entero devuelve 403 tanto con rango abierto (`bytes=0-`) como acotado
+ * (`bytes=0-<final>`) o sin rango. El diagnóstico sólo probaba un byte, así que
+ * daba por buena una forma de pedir que la descarga real nunca usaba.
  *
- * `bytes=0-` pide desde el primer byte hasta el final, así que se descarga el
- * archivo completo en una sola respuesta 206.
+ * Por eso yt-dlp descarga googlevideo por trozos, y por eso lo hacemos aquí.
+ * 1 MiB es un compromiso: pocas peticiones y lejos del umbral que dispara el
+ * rechazo.
  */
-const RANGE_HEADER = { Range: 'bytes=0-' };
+const CHUNK_SIZE = 1_048_576;
 
-/** Una forma concreta de pedir el archivo, con su etiqueta para el informe. */
-type Strategy = { label: string; headers: Record<string, string> };
+/** Si un trozo es rechazado se reintenta con la mitad, hasta este mínimo. */
+const MIN_CHUNK_SIZE = 65_536;
 
-/**
- * Formas de pedir el audio, en orden de preferencia.
- *
- * Se probó en dispositivo que googlevideo acepta las cuatro combinaciones de
- * rango y User-Agent sobre una URL recién obtenida (200 y 206 respectivamente),
- * y aun así la descarga fallaba con 403. La diferencia estaba en que la
- * comprobación previa y la descarga hacían peticiones DISTINTAS, de modo que el
- * éxito de una no predecía nada sobre la otra.
- *
- * Se abandona esa separación: ahora se intenta la descarga de verdad con cada
- * forma, en orden, y se usa la primera que funcione. La primera de la lista es
- * exactamente la que el diagnóstico demostró que pasa.
- */
-function strategies(sizeHint: number | null): Strategy[] {
-  const list: Strategy[] = [{ label: 'rango abierto', headers: { ...RANGE_HEADER } }];
-
-  // Algunas URLs rechazan el rango abierto pero aceptan uno acotado, que es
-  // como descarga yt-dlp.
-  if (sizeHint && sizeHint > 0) {
-    list.push({ label: 'rango acotado', headers: { Range: `bytes=0-${sizeHint - 1}` } });
-  }
-
-  // Las peticiones sin rango van al final, y no primero como estaban. Medido en
-  // dispositivo sobre un video real: con rango responde 206, sin rango responde
-  // 403. El video de referencia aceptaba las cuatro formas, y eso fue lo que
-  // hizo descartar la pista correcta durante varias rondas.
-  list.push(
-    { label: 'sin rango + UA', headers: { 'User-Agent': IOS_UA } },
-    { label: 'sin rango', headers: {} },
-  );
-  return list;
+/** Total real del archivo, leído de `Content-Range: bytes 0-1023/5400000`. */
+function totalFromContentRange(header: string | null): number {
+  const match = header?.match(/\/(\d+)\s*$/);
+  return match ? Number(match[1]) : 0;
 }
 
-/**
- * Descarga de respaldo, escribiendo los bytes desde JavaScript.
- *
- * El descargador nativo usa OkHttp, con cabeceras por defecto distintas a las
- * del `fetch` de React Native, así que puede ser rechazado por googlevideo
- * aunque la comprobación previa haya pasado — que es justo el punto ciego de
- * `preflight`. Esta vía usa exactamente el mismo cliente HTTP que sí funcionó.
- *
- * A cambio se pierde el progreso granular (`arrayBuffer()` es todo o nada) y el
- * archivo pasa entero por memoria. Para pistas de audio de unos pocos MB es
- * perfectamente asumible; por eso es el respaldo y no la vía principal.
- */
-async function downloadViaFetch(
+/** Pide un trozo concreto. Devuelve los bytes y el tamaño total del archivo. */
+async function fetchChunk(
   url: string,
   headers: Record<string, string>,
-  dest: File,
-): Promise<number> {
-  const res = await fetch(url, { headers });
-  // 206 (contenido parcial) es la respuesta esperada a una petición por rango.
-  if (!res.ok && res.status !== 206) {
+  start: number,
+  end: number,
+): Promise<{ bytes: Uint8Array; total: number }> {
+  const res = await fetch(url, {
+    headers: { ...headers, Range: `bytes=${start}-${end}` },
+  });
+
+  // 206 es la respuesta correcta a un rango. Un 200 significa que el servidor
+  // ignoró el rango y mandó el archivo entero, lo cual también sirve.
+  if (res.status !== 206 && !res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
 
-  const buffer = await res.arrayBuffer();
-  if (buffer.byteLength === 0) throw new Error('archivo vacío');
-
-  if (dest.exists) dest.delete();
-  dest.create({ intermediates: true });
-  dest.write(new Uint8Array(buffer));
-  return buffer.byteLength;
+  return {
+    bytes: new Uint8Array(await res.arrayBuffer()),
+    total: totalFromContentRange(res.headers.get('content-range')),
+  };
 }
 
 /**
- * Descarga el audio probando cada estrategia hasta que una funcione.
+ * Descarga el audio pidiéndolo por trozos.
  *
- * Devuelve la etiqueta de la que sirvió, para poder saber cuál fue sin tener que
- * conectar el teléfono a un depurador. Si fallan todas, el error enumera qué
- * respondió cada una: es la única forma de distinguir "YouTube rechaza todo" de
- * "YouTube rechaza esta forma concreta de pedirlo".
+ * Cada trozo va con su propio `Range` acotado, que es la forma que googlevideo
+ * acepta. Si un trozo es rechazado se parte por la mitad y se reintenta: así el
+ * tamaño se ajusta solo al umbral del servidor sin tener que adivinarlo, y de
+ * paso el enlace se renueva por si el rechazo vino de que caducó.
+ *
+ * Los trozos se acumulan en memoria y se escriben de una vez al final. Un
+ * archivo de audio típico ronda los 5 MB, así que el coste es asumible y evita
+ * depender de escritura por anexado.
  */
 async function downloadAudio(
   url: string,
   dest: File,
   sizeHint: number | null,
-  onAttempt: (label: string) => void,
+  onProgress: (ratio: number | null) => void,
   refreshUrl: () => Promise<string>,
 ): Promise<string> {
-  const failures: string[] = [];
+  const headers = { 'User-Agent': IOS_UA };
+  const parts: Uint8Array[] = [];
+
   let current = url;
+  let offset = 0;
+  let total = sizeHint && sizeHint > 0 ? sizeHint : 0;
+  let chunkSize = CHUNK_SIZE;
+  let lastError = '';
 
-  const list = strategies(sizeHint);
+  // Cota de seguridad: con trozos de 64 KiB esto cubre 128 MiB, muy por encima
+  // de cualquier pista de audio. Evita un bucle infinito si el servidor
+  // devolviera respuestas vacías indefinidamente.
+  for (let request = 0; request < 2000; request++) {
+    const end = total ? Math.min(offset + chunkSize, total) - 1 : offset + chunkSize - 1;
 
-  for (let i = 0; i < list.length; i++) {
-    const { label, headers } = list[i];
+    try {
+      const { bytes, total: reported } = await fetchChunk(current, headers, offset, end);
 
-    // Tras un rechazo se pide una URL nueva antes de volver a intentar.
-    // googlevideo invalida la URL después de rechazarla, así que reutilizarla
-    // hace que los intentos siguientes fallen aunque su forma fuese correcta
-    // — que es exactamente lo que enmascaró el problema en la ronda anterior.
-    if (i > 0) {
-      onAttempt('renovando enlace');
+      if (bytes.byteLength === 0) break;
+      if (!total && reported) total = reported;
+
+      parts.push(bytes);
+      offset += bytes.byteLength;
+      onProgress(total ? Math.min(offset / total, 1) : null);
+
+      if (total && offset >= total) break;
+      // Sin total conocido, un trozo más corto de lo pedido significa el final.
+      if (!total && bytes.byteLength < chunkSize) break;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : 'error';
+
+      if (chunkSize <= MIN_CHUNK_SIZE) {
+        throw new Error(
+          `Rechazado en el byte ${offset} con trozos de ${Math.round(chunkSize / 1024)} KiB ` +
+            `(${lastError}).`,
+        );
+      }
+
+      // Trozo más pequeño y enlace nuevo antes de reintentar.
+      chunkSize = Math.max(Math.floor(chunkSize / 2), MIN_CHUNK_SIZE);
       try {
         current = await refreshUrl();
       } catch {
-        // Si no se puede renovar, se prueba igual con la que ya se tenía.
+        // Si no se puede renovar seguimos con la que ya teníamos.
       }
-    }
-
-    onAttempt(label);
-    try {
-      await downloadViaFetch(current, headers, dest);
-      return label;
-    } catch (err) {
-      failures.push(`${label}: ${err instanceof Error ? err.message : 'error'}`);
     }
   }
 
-  throw new Error(`Ninguna vía funcionó — ${failures.join(' · ')}`);
+  if (!parts.length) throw new Error(`No se recibió ningún dato (${lastError || 'sin detalle'})`);
+
+  const size = parts.reduce((sum, p) => sum + p.byteLength, 0);
+  const merged = new Uint8Array(size);
+  let cursor = 0;
+  for (const part of parts) {
+    merged.set(part, cursor);
+    cursor += part.byteLength;
+  }
+
+  if (dest.exists) dest.delete();
+  dest.create({ intermediates: true });
+  dest.write(merged);
+
+  return `${parts.length} trozos de ${Math.round(chunkSize / 1024)} KiB`;
 }
 
 /**
@@ -333,12 +335,14 @@ class DownloadManager {
       // porque permite controlar las cabeceras exactas de cada intento. El
       // precio es perder el progreso granular: `arrayBuffer()` es todo o nada,
       // así que la barra queda indeterminada.
-      this.patch(id, { progress: null });
+      this.patch(id, { progress: 0 });
       const winner = await downloadAudio(
         resolved.streamUrl,
         dest,
         resolved.approxBytes,
-        (label) => this.patch(id, { stage: `Descargando (${label})…` }),
+        (ratio) => {
+          if (!this.cancelled.has(id)) this.patch(id, { progress: ratio });
+        },
         () => refreshStreamUrl(resolved.id),
       );
       this.patch(id, { stage: null, progress: 1, via: winner });
