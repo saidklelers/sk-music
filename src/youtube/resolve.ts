@@ -297,6 +297,19 @@ export async function resolveTrack(
   );
 }
 
+/**
+ * Vuelve a pedir sólo la URL de stream.
+ *
+ * googlevideo invalida una URL después de rechazarla, así que reintentar con
+ * otra forma de petición exige pedir una nueva; reutilizar la quemada hace
+ * fallar intentos que de otro modo funcionarían. También sirve cuando la URL
+ * simplemente caducó: duran unas horas.
+ */
+export async function refreshStreamUrl(videoId: string): Promise<string> {
+  const resolved = await resolveTrack(videoId);
+  return resolved.streamUrl;
+}
+
 /** Búsqueda por texto, para no depender de tener el link a mano. */
 export async function searchTracks(query: string, limit = 20): Promise<SearchResult[]> {
   const q = query.trim();

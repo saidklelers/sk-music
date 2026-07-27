@@ -168,12 +168,25 @@ export async function diagnose(videoId?: string): Promise<string> {
   }
 
   const anyOk = out.some((l) => l.includes(': OK — audio'));
+  // El veredicto tiene que mirar la prueba de descarga, no sólo que exista una
+  // URL: decir "deberían funcionar" mientras las peticiones sin rango daban 403
+  // fue precisamente lo que ocultó la causa durante varias rondas.
+  const rangeWorks = out.some((l) => l.includes('con rango') && l.includes('OK'));
+  const plainFails = out.some((l) => l.includes('sin rango') && l.includes('RECHAZADO'));
+
   out.push('');
-  out.push(
-    anyOk
-      ? 'Resultado: al menos un cliente entrega audio. Las descargas deberían funcionar.'
-      : 'Resultado: ningún cliente entrega audio en claro. Toca actualizar youtubei.js y recompilar.',
-  );
+  if (!anyOk) {
+    out.push('Resultado: ningún cliente entrega audio en claro.');
+    out.push('Toca actualizar youtubei.js y recompilar.');
+  } else if (rangeWorks && plainFails) {
+    out.push('Resultado: este video EXIGE petición por rango.');
+    out.push('Es lo esperado; la app pide con rango primero.');
+  } else if (rangeWorks) {
+    out.push('Resultado: el servidor acepta la descarga de cualquier forma.');
+  } else {
+    out.push('Resultado: hay URL de audio pero el servidor la rechaza siempre.');
+    out.push('Revisa expire, n, pot e IP de arriba.');
+  }
 
   return out.join('\n');
 }

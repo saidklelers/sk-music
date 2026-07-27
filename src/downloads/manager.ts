@@ -1,7 +1,7 @@
 import { File } from 'expo-file-system';
 
 import type { Track } from '@/db';
-import { resolveTrack, stageLabel, type ResolvedTrack } from '@/youtube/resolve';
+import { refreshStreamUrl, resolveTrack, stageLabel, type ResolvedTrack } from '@/youtube/resolve';
 
 import { artworkFile, ensureDirs, trackFile } from './storage';
 
@@ -71,16 +71,22 @@ type Strategy = { label: string; headers: Record<string, string> };
  * exactamente la que el diagnóstico demostró que pasa.
  */
 function strategies(sizeHint: number | null): Strategy[] {
-  const list: Strategy[] = [
-    { label: 'directo', headers: {} },
-    { label: 'directo + UA', headers: { 'User-Agent': IOS_UA } },
-    { label: 'rango abierto', headers: { ...RANGE_HEADER } },
-  ];
-  // Algunas URLs de googlevideo rechazan el rango abierto pero aceptan uno
-  // acotado, que es como descarga yt-dlp.
+  const list: Strategy[] = [{ label: 'rango abierto', headers: { ...RANGE_HEADER } }];
+
+  // Algunas URLs rechazan el rango abierto pero aceptan uno acotado, que es
+  // como descarga yt-dlp.
   if (sizeHint && sizeHint > 0) {
     list.push({ label: 'rango acotado', headers: { Range: `bytes=0-${sizeHint - 1}` } });
   }
+
+  // Las peticiones sin rango van al final, y no primero como estaban. Medido en
+  // dispositivo sobre un video real: con rango responde 206, sin rango responde
+  // 403. El video de referencia aceptaba las cuatro formas, y eso fue lo que
+  // hizo descartar la pista correcta durante varias rondas.
+  list.push(
+    { label: 'sin rango + UA', headers: { 'User-Agent': IOS_UA } },
+    { label: 'sin rango', headers: {} },
+  );
   return list;
 }
 
@@ -129,13 +135,32 @@ async function downloadAudio(
   dest: File,
   sizeHint: number | null,
   onAttempt: (label: string) => void,
+  refreshUrl: () => Promise<string>,
 ): Promise<string> {
   const failures: string[] = [];
+  let current = url;
 
-  for (const { label, headers } of strategies(sizeHint)) {
+  const list = strategies(sizeHint);
+
+  for (let i = 0; i < list.length; i++) {
+    const { label, headers } = list[i];
+
+    // Tras un rechazo se pide una URL nueva antes de volver a intentar.
+    // googlevideo invalida la URL después de rechazarla, así que reutilizarla
+    // hace que los intentos siguientes fallen aunque su forma fuese correcta
+    // — que es exactamente lo que enmascaró el problema en la ronda anterior.
+    if (i > 0) {
+      onAttempt('renovando enlace');
+      try {
+        current = await refreshUrl();
+      } catch {
+        // Si no se puede renovar, se prueba igual con la que ya se tenía.
+      }
+    }
+
     onAttempt(label);
     try {
-      await downloadViaFetch(url, headers, dest);
+      await downloadViaFetch(current, headers, dest);
       return label;
     } catch (err) {
       failures.push(`${label}: ${err instanceof Error ? err.message : 'error'}`);
@@ -314,6 +339,7 @@ class DownloadManager {
         dest,
         resolved.approxBytes,
         (label) => this.patch(id, { stage: `Descargando (${label})…` }),
+        () => refreshStreamUrl(resolved.id),
       );
       this.patch(id, { stage: null, progress: 1, via: winner });
 
