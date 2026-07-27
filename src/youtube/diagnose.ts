@@ -34,7 +34,46 @@ const NET_PROBE_TIMEOUT_MS = 240_000;
  * URLs en claro— y desde la app no hay forma de distinguirlos. Esto lo hace
  * visible sin tener que conectar el teléfono a un depurador.
  */
-export async function diagnose(): Promise<string> {
+/**
+ * Radiografía de la URL de audio.
+ *
+ * Cuando una URL sirve y otra no, la explicación está en sus parámetros, no en
+ * cómo se pide. Interesan cuatro:
+ *
+ * - `expire`: caducidad. Si ya pasó, el 403 es simplemente eso.
+ * - `n`: parámetro de estrangulamiento. Descifrarlo exige el JS player, que
+ *   está desactivado a propósito porque bloquea el hilo de JS en Hermes. Si
+ *   está presente, YouTube puede rechazar la petición.
+ * - `pot`: Proof of Origin Token. Si YouTube lo exige para este video y no lo
+ *   llevamos, responde 403 y no hay cabecera que lo arregle.
+ * - `ip`: si la URL está atada a una IP distinta a la actual, también da 403.
+ */
+function describeUrl(url: string): string[] {
+  const lines: string[] = [];
+  try {
+    const q = new URL(url).searchParams;
+
+    const expire = Number(q.get('expire'));
+    if (expire) {
+      const left = Math.round((expire * 1000 - Date.now()) / 1000);
+      lines.push(`   expire: ${left > 0 ? `caduca en ${left}s` : `CADUCADA hace ${-left}s`}`);
+    }
+    lines.push(`   n (estrangulamiento): ${q.get('n') ? 'SÍ presente' : 'ausente'}`);
+    lines.push(`   pot (proof of origin): ${q.get('pot') ? 'SÍ presente' : 'ausente'}`);
+    lines.push(`   atada a IP: ${q.get('ip') ?? 'no'}`);
+    lines.push(`   cliente en URL: ${q.get('c') ?? '?'}`);
+  } catch {
+    lines.push('   (no se pudo leer la URL)');
+  }
+  return lines;
+}
+
+/**
+ * @param videoId Video a probar. Sin él usa el de referencia, que sirve para
+ * saber si la cadena funciona en general; con él se prueba justo el que falla,
+ * que es lo que permite distinguir un problema del método de uno del video.
+ */
+export async function diagnose(videoId?: string): Promise<string> {
   const out: string[] = [];
   const stamp = (start: number) => `${Date.now() - start} ms`;
 
@@ -78,11 +117,14 @@ export async function diagnose(): Promise<string> {
 
   /* 3. Cada cliente por separado. */
   const yt = await getInnertube();
+  const target = videoId ?? PROBE_ID;
+  out.push('');
+  out.push(`Video: ${target}${videoId ? '' : ' (referencia)'}`);
 
   for (const client of CLIENTS) {
     const tCli = Date.now();
     try {
-      const info = await yt.getBasicInfo(PROBE_ID, { client });
+      const info = await yt.getBasicInfo(target, { client });
       const fmt = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' }) as
         | { url?: string; signature_cipher?: string; cipher?: string; content_length?: number }
         | undefined;
@@ -96,6 +138,9 @@ export async function diagnose(): Promise<string> {
       } else {
         const mb = fmt.content_length ? (fmt.content_length / 1048576).toFixed(1) : '?';
         out.push(`${client}: OK — audio de ${mb} MB (${stamp(tCli)})`);
+        // Los parámetros de la URL son lo que distingue una que sirve de una
+        // que no; sin esto sólo se ve el 403 sin saber por qué.
+        out.push(...describeUrl(fmt.url));
 
         // Tener una URL no significa que googlevideo la vaya a servir. Se
         // prueban las cuatro combinaciones porque las dos dimensiones importan

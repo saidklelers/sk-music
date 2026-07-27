@@ -1,6 +1,15 @@
 import Constants from 'expo-constants';
 import { useCallback, useState } from 'react';
-import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  Alert,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Logo } from '@/components/Logo';
@@ -11,6 +20,7 @@ import { formatBytes, pluralTracks } from '@/lib/format';
 import { colors, layout, radius, space, type } from '@/theme';
 import { diagnose } from '@/youtube/diagnose';
 import { resetInnertube } from '@/youtube/innertube';
+import { parseVideoId } from '@/youtube/resolve';
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
@@ -18,19 +28,31 @@ export default function SettingsScreen() {
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<string | null>(null);
   const [diagnosing, setDiagnosing] = useState(false);
+  const [probeLink, setProbeLink] = useState('');
 
-  /** Prueba la cadena completa y deja el informe en pantalla para copiarlo. */
+  /**
+   * Prueba la cadena completa y deja el informe en pantalla para copiarlo.
+   *
+   * Acepta un link opcional porque probar siempre un video de referencia sólo
+   * dice si el método funciona en general; para saber si el problema es de un
+   * video concreto hay que probar ese.
+   */
   const runDiagnosis = useCallback(async () => {
     setDiagnosing(true);
     setReport('Probando…');
     try {
-      setReport(await diagnose());
+      const id = probeLink.trim() ? parseVideoId(probeLink) : undefined;
+      if (probeLink.trim() && !id) {
+        setReport('Ese link no es de YouTube. Pega la URL del video o déjalo vacío.');
+        return;
+      }
+      setReport(await diagnose(id ?? undefined));
     } catch (err) {
       setReport(`El diagnóstico falló: ${err instanceof Error ? err.message : 'error'}`);
     } finally {
       setDiagnosing(false);
     }
-  }, []);
+  }, [probeLink]);
 
   /** Borra audio y carátulas que quedaron sin registro en la base. */
   const cleanOrphans = useCallback(async () => {
@@ -97,6 +119,22 @@ export default function SettingsScreen() {
           disabled={diagnosing}
           last
         />
+      </View>
+
+      <View style={styles.probeBox}>
+        <TextInput
+          value={probeLink}
+          onChangeText={setProbeLink}
+          placeholder="Link a probar (opcional)"
+          placeholderTextColor={colors.textFaint}
+          style={styles.probeInput}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        <Text style={styles.probeHint}>
+          Déjalo vacío para probar con un video de referencia. Pega el link que te falla para
+          saber si el problema es de ese video en concreto.
+        </Text>
       </View>
 
       {!!report && (
@@ -191,6 +229,25 @@ const styles = StyleSheet.create({
   },
   rowLabel: { ...type.body, color: colors.textMuted },
   rowValue: { ...type.body, color: colors.text },
+
+  probeBox: {
+    marginHorizontal: space.lg,
+    marginTop: space.md,
+    gap: space.sm,
+  },
+  probeInput: {
+    height: 46,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    paddingHorizontal: space.md,
+    ...type.body,
+    color: colors.text,
+  },
+  probeHint: {
+    ...type.small,
+    color: colors.textFaint,
+    lineHeight: 17,
+  },
 
   report: {
     marginHorizontal: space.lg,
