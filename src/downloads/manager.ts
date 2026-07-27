@@ -65,40 +65,67 @@ function totalFromContentRange(header: string | null): number {
   return match ? Number(match[1]) : 0;
 }
 
-/** Pide un trozo concreto. Devuelve los bytes y el tamaño total del archivo. */
-async function fetchChunk(
-  url: string,
-  headers: Record<string, string>,
-  start: number,
-  end: number,
-): Promise<{ bytes: Uint8Array; total: number }> {
-  const res = await fetch(url, {
-    headers: { ...headers, Range: `bytes=${start}-${end}` },
-  });
-
-  // 206 es la respuesta correcta a un rango. Un 200 significa que el servidor
-  // ignoró el rango y mandó el archivo entero, lo cual también sirve.
-  if (res.status !== 206 && !res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-
-  return {
-    bytes: new Uint8Array(await res.arrayBuffer()),
-    total: totalFromContentRange(res.headers.get('content-range')),
-  };
+/**
+ * Rango como parámetro de la URL en vez de cabecera.
+ *
+ * Es la forma nativa de googlevideo, y la que usa yt-dlp. Se prueba cuando la
+ * cabecera `Range` es rechazada, porque el servidor no las trata igual.
+ */
+function withRangeParam(url: string, start: number, end: number): string {
+  const parsed = new URL(url);
+  parsed.searchParams.set('range', `${start}-${end}`);
+  return parsed.toString();
 }
 
 /**
- * Descarga el audio pidiéndolo por trozos.
+ * Pide un trozo concreto, probando las dos formas de expresar el rango.
+ * Devuelve los bytes y el tamaño total del archivo.
+ */
+async function fetchChunk(
+  url: string,
+  start: number,
+  end: number,
+): Promise<{ bytes: Uint8Array; total: number }> {
+  const headers = { 'User-Agent': IOS_UA };
+
+  const attempts: (() => Promise<Response>)[] = [
+    () => fetch(url, { headers: { ...headers, Range: `bytes=${start}-${end}` } }),
+    () => fetch(withRangeParam(url, start, end), { headers }),
+  ];
+
+  let lastStatus = 0;
+  for (const attempt of attempts) {
+    const res = await attempt();
+    // 206 es la respuesta correcta a un rango; un 200 significa que el servidor
+    // lo ignoró y mandó todo, lo cual también sirve.
+    if (res.status === 206 || res.ok) {
+      return {
+        bytes: new Uint8Array(await res.arrayBuffer()),
+        total: totalFromContentRange(res.headers.get('content-range')),
+      };
+    }
+    lastStatus = res.status;
+  }
+
+  throw new Error(`HTTP ${lastStatus}`);
+}
+
+/**
+ * Descarga el audio pidiéndolo por trozos, con un enlace nuevo para cada uno.
  *
- * Cada trozo va con su propio `Range` acotado, que es la forma que googlevideo
- * acepta. Si un trozo es rechazado se parte por la mitad y se reintenta: así el
- * tamaño se ajusta solo al umbral del servidor sin tener que adivinarlo, y de
- * paso el enlace se renueva por si el rechazo vino de que caducó.
+ * La clave es renovar SIEMPRE, no sólo tras un fallo. Medido en dispositivo: el
+ * primer trozo de 1 MiB entra bien y el siguiente es rechazado aunque se reduzca
+ * hasta 64 KiB, y en el diagnóstico las primeras peticiones pasan y las
+ * posteriores no. Es decir, la URL no tiene un límite de tamaño sino de uso: se
+ * agota tras servir una petición. Lo que parecía un umbral de 4 MiB era en
+ * realidad el cuarto intento sobre la misma URL.
  *
- * Los trozos se acumulan en memoria y se escriben de una vez al final. Un
- * archivo de audio típico ronda los 5 MB, así que el coste es asumible y evita
- * depender de escritura por anexado.
+ * Resolver de nuevo cuesta unos 400 ms por trozo, que para un archivo de 5 MB
+ * son unos pocos segundos de más. Es el precio de que funcione.
+ *
+ * Los trozos se acumulan en memoria y se escriben de una vez al final: una pista
+ * de audio ronda los 5 MB, así que sale más barato que depender de escritura por
+ * anexado.
  */
 async function downloadAudio(
   url: string,
@@ -107,23 +134,36 @@ async function downloadAudio(
   onProgress: (ratio: number | null) => void,
   refreshUrl: () => Promise<string>,
 ): Promise<string> {
-  const headers = { 'User-Agent': IOS_UA };
   const parts: Uint8Array[] = [];
 
   let current = url;
   let offset = 0;
   let total = sizeHint && sizeHint > 0 ? sizeHint : 0;
   let chunkSize = CHUNK_SIZE;
-  let lastError = '';
+  let renewals = 0;
 
-  // Cota de seguridad: con trozos de 64 KiB esto cubre 128 MiB, muy por encima
-  // de cualquier pista de audio. Evita un bucle infinito si el servidor
-  // devolviera respuestas vacías indefinidamente.
-  for (let request = 0; request < 2000; request++) {
+  // Cota de seguridad frente a un bucle infinito si el servidor devolviera
+  // respuestas vacías indefinidamente.
+  for (let request = 0; request < 500; request++) {
+    // Enlace nuevo para cada trozo salvo el primero, que ya viene recién
+    // resuelto. Un fallo aquí sí se propaga: tragárselo dejaba reutilizando la
+    // URL agotada y convertía el problema real en un 403 indescifrable.
+    if (request > 0) {
+      try {
+        current = await refreshUrl();
+        renewals++;
+      } catch (err) {
+        throw new Error(
+          `No se pudo renovar el enlace en el byte ${offset}: ` +
+            `${err instanceof Error ? err.message : 'error'}`,
+        );
+      }
+    }
+
     const end = total ? Math.min(offset + chunkSize, total) - 1 : offset + chunkSize - 1;
 
     try {
-      const { bytes, total: reported } = await fetchChunk(current, headers, offset, end);
+      const { bytes, total: reported } = await fetchChunk(current, offset, end);
 
       if (bytes.byteLength === 0) break;
       if (!total && reported) total = reported;
@@ -136,26 +176,22 @@ async function downloadAudio(
       // Sin total conocido, un trozo más corto de lo pedido significa el final.
       if (!total && bytes.byteLength < chunkSize) break;
     } catch (err) {
-      lastError = err instanceof Error ? err.message : 'error';
+      const detail = err instanceof Error ? err.message : 'error';
 
       if (chunkSize <= MIN_CHUNK_SIZE) {
         throw new Error(
-          `Rechazado en el byte ${offset} con trozos de ${Math.round(chunkSize / 1024)} KiB ` +
-            `(${lastError}).`,
+          `Rechazado en el byte ${offset} de ${total || '?'} con trozos de ` +
+            `${Math.round(chunkSize / 1024)} KiB tras ${renewals} renovaciones (${detail}).`,
         );
       }
 
-      // Trozo más pequeño y enlace nuevo antes de reintentar.
+      // Con enlace nuevo cada vez, un rechazo apunta a que el trozo es
+      // demasiado grande: se parte por la mitad y se reintenta el mismo offset.
       chunkSize = Math.max(Math.floor(chunkSize / 2), MIN_CHUNK_SIZE);
-      try {
-        current = await refreshUrl();
-      } catch {
-        // Si no se puede renovar seguimos con la que ya teníamos.
-      }
     }
   }
 
-  if (!parts.length) throw new Error(`No se recibió ningún dato (${lastError || 'sin detalle'})`);
+  if (!parts.length) throw new Error('No se recibió ningún dato del servidor.');
 
   const size = parts.reduce((sum, p) => sum + p.byteLength, 0);
   const merged = new Uint8Array(size);

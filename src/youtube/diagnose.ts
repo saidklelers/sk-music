@@ -140,29 +140,57 @@ export async function diagnose(videoId?: string): Promise<string> {
         // que no; sin esto sólo se ve el 403 sin saber por qué.
         out.push(...describeUrl(fmt.url));
 
-        // Lo decisivo no es SI la petición lleva rango, sino CUÁNTO pide: se
-        // midió que un byte pasa y el archivo entero se rechaza. Se prueba una
-        // escala de tamaños para ver dónde está el umbral exacto, que es lo que
-        // determina el tamaño de trozo que usa la descarga.
-        const sizes: [string, string][] = [
-          ['1 byte', 'bytes=0-0'],
-          ['64 KiB', 'bytes=0-65535'],
-          ['1 MiB', 'bytes=0-1048575'],
-          ['4 MiB', 'bytes=0-4194303'],
+        /*
+         * Experimento decisivo: separar "límite de tamaño" de "URL de un solo
+         * uso".
+         *
+         * La tanda REUTILIZADA repite peticiones sobre la misma URL; la tanda
+         * FRESCA resuelve una URL nueva antes de cada una. Si en la reutilizada
+         * los primeros pasan y los siguientes no, pero en la fresca pasan todos,
+         * el problema es de uso y no de tamaño — y entonces hay que renovar el
+         * enlace en cada trozo, no reducir el trozo.
+         */
+        const sizes: [string, number][] = [
+          ['1 byte', 1],
+          ['64 KiB', 65_536],
+          ['1 MiB', 1_048_576],
+          ['4 MiB', 4_194_304],
         ];
-        if (fmt.content_length) {
-          sizes.push(['archivo entero', `bytes=0-${fmt.content_length - 1}`]);
-        }
 
-        for (const [label, range] of sizes) {
+        const probeRange = async (url: string, bytes: number) => {
+          const res = await fetch(url, {
+            method: 'GET',
+            headers: { Range: `bytes=0-${bytes - 1}`, 'User-Agent': IOS_UA },
+          });
+          return `HTTP ${res.status} ${res.status === 206 || res.ok ? 'OK' : 'RECHAZADO'}`;
+        };
+
+        out.push('  — misma URL, peticiones seguidas —');
+        for (const [label, bytes] of sizes) {
           const tDl = Date.now();
           try {
-            const probe = await fetch(fmt.url, {
-              method: 'GET',
-              headers: { Range: range, 'User-Agent': IOS_UA },
-            });
-            const verdict = probe.status === 206 || probe.ok ? 'OK' : 'RECHAZADO';
-            out.push(`   ${label}: HTTP ${probe.status} ${verdict} (${stamp(tDl)})`);
+            out.push(`   ${label}: ${await probeRange(fmt.url, bytes)} (${stamp(tDl)})`);
+          } catch (err) {
+            out.push(`   ${label}: FALLA — ${err instanceof Error ? err.message : 'error'}`);
+          }
+        }
+
+        out.push('  — URL nueva para cada una —');
+        for (const [label, bytes] of sizes) {
+          const tDl = Date.now();
+          try {
+            const fresh = await yt.getBasicInfo(target, { client });
+            const freshFmt = fresh.chooseFormat({
+              type: 'audio',
+              quality: 'best',
+              format: 'mp4',
+            }) as { url?: string } | undefined;
+
+            if (!freshFmt?.url) {
+              out.push(`   ${label}: no se pudo renovar la URL`);
+              continue;
+            }
+            out.push(`   ${label}: ${await probeRange(freshFmt.url, bytes)} (${stamp(tDl)})`);
           } catch (err) {
             out.push(`   ${label}: FALLA — ${err instanceof Error ? err.message : 'error'}`);
           }
