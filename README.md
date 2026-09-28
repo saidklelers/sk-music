@@ -19,7 +19,9 @@ iOS: no hay descarga directa. Ver [Compilar para iPhone](#compilar-para-iphone).
 - **Descarga desde YouTube** pegando el link, o buscando por nombre desde la propia app.
 - **Reproducción sin conexión.** Una vez descargada, la canción vive en el dispositivo.
 - **Audio en segundo plano** con controles en la pantalla bloqueada.
-- **Listas de reproducción**, cola, aleatorio y repetición.
+- **Listas de reproducción**, cola, aleatorio y repetición (se recuerdan entre sesiones).
+- **Biblioteca ordenable** por recientes, título o artista, con reproducir todo / aleatorio.
+- **Edición de título y artista** de cada canción, y listas que se pueden renombrar.
 - **Sin servidor.** No hay backend que mantener ni por el que pasen tus datos: la extracción ocurre completa en el teléfono.
 - **Sin cuentas, sin anuncios, sin telemetría.**
 
@@ -30,7 +32,9 @@ link de YouTube
       ↓
 youtubei.js  ──  resuelve metadatos y la URL del stream de audio
       ↓
-expo-file-system  ──  descarga el m4a al almacenamiento de la app
+fetch por trozos  ──  baja el m4a de 1 MiB en 1 MiB, con enlace nuevo por trozo
+      ↓
+expo-file-system  ──  escribe cada trozo en disco y renombra al terminar
       ↓
 SQLite  ──  guarda título, artista, duración y rutas
       ↓
@@ -42,6 +46,8 @@ Tres decisiones que vale la pena explicar:
 **Se pide m4a/AAC, no webm/opus.** YouTube sirve la mayoría del audio en webm/opus, que Android reproduce pero iOS no. Pedir m4a explícitamente evita tener que transcodificar, algo que no es viable en el dispositivo, y el formato está disponible en prácticamente todos los videos.
 
 **Se prueban varios clientes de YouTube en orden**, con el de iOS primero: es el que entrega URLs de audio sin cifrar ni estrangular, y sin exigir PoToken.
+
+**Se descarga por trozos y con un enlace nuevo para cada uno.** googlevideo rechaza (403) las peticiones grandes y además agota cada URL tras servir una sola. Medido en dispositivo: un byte entra, el archivo entero no; el primer trozo de una URL entra, el segundo no. La descarga se escribe en un `.part` y sólo toma el nombre definitivo cuando llegó completa: un audio truncado nunca se guarda como bueno.
 
 **En la base de datos se guarda solo el nombre del archivo, nunca la ruta absoluta.** En iOS el contenedor de la app cambia de ubicación entre instalaciones y actualizaciones, así que una URI absoluta guardada hoy apunta a la nada mañana. La ruta se rearma en cada lectura.
 
@@ -69,10 +75,12 @@ npx expo start
 Comprobaciones:
 
 ```bash
-npx tsc --noEmit
-npx expo lint
+npm run check      # tipos + lint + tests
+npm test           # sólo los tests
 npx expo-doctor
 ```
+
+Los tests usan el runner nativo de Node (hace falta Node 22.18 o superior, que ejecuta TypeScript sin compilar) y cubren la lógica pura: la descarga por trozos contra un googlevideo simulado, la cola del reproductor, el parser de links y los formatos. En cada PR se ejecutan solos con GitHub Actions.
 
 ### Estructura
 
@@ -87,6 +95,7 @@ src/
 ├── player/         Estado global del reproductor
 ├── theme/          Paleta, tipografía y espaciado
 └── youtube/        Cliente Innertube y resolución de links
+test/               Tests de la lógica pura (node --test)
 ```
 
 ## Compilar

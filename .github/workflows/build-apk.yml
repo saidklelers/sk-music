@@ -26,7 +26,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 20 dejó de tener soporte en abril de 2026.
+          node-version: 22
           cache: npm
 
       - uses: actions/setup-java@v4
