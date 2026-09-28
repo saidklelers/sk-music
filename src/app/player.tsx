@@ -1,4 +1,5 @@
 import { useRouter } from 'expo-router';
+import { useEffect } from 'react';
 import { Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -41,11 +42,16 @@ export default function PlayerScreen() {
     cycleRepeat,
   } = usePlayer();
 
-  if (!current) {
-    // Puede pasar si la canción se borró mientras el modal estaba abierto.
-    router.back();
-    return null;
-  }
+  // Sin canción (se borró con el modal abierto, o se llegó por un enlace) no hay
+  // nada que mostrar. Navegar es un efecto secundario: hacerlo durante el render,
+  // como antes, es justo lo que React prohíbe.
+  useEffect(() => {
+    if (current) return;
+    if (router.canGoBack()) router.back();
+    else router.replace('/');
+  }, [current, router]);
+
+  if (!current) return null;
 
   // La carátula se lleva el ancho menos márgenes, con techo para que en
   // tablets no crezca hasta comerse los controles.
@@ -57,6 +63,7 @@ export default function PlayerScreen() {
         <Pressable
           onPress={() => router.back()}
           hitSlop={12}
+          accessibilityLabel="Cerrar reproductor"
           style={({ pressed }) => pressed && { opacity: 0.6 }}>
           <ChevronDown size={26} color={colors.textMuted} />
         </Pressable>
@@ -89,6 +96,8 @@ export default function PlayerScreen() {
         <Pressable
           onPress={toggleShuffle}
           hitSlop={12}
+          accessibilityLabel="Aleatorio"
+          accessibilityState={{ checked: shuffle }}
           style={({ pressed }) => pressed && { opacity: 0.6 }}>
           <Shuffle size={21} color={shuffle ? colors.accent : colors.textFaint} />
         </Pressable>
@@ -97,6 +106,7 @@ export default function PlayerScreen() {
           onPress={prev}
           disabled={!hasPrev && position <= 4}
           hitSlop={12}
+          accessibilityLabel="Anterior"
           style={({ pressed }) => [
             !hasPrev && position <= 4 && { opacity: 0.3 },
             pressed && { opacity: 0.6 },
@@ -106,6 +116,7 @@ export default function PlayerScreen() {
 
         <Pressable
           onPress={toggle}
+          accessibilityLabel={isPlaying ? 'Pausar' : 'Reproducir'}
           style={({ pressed }) => [styles.playBtn, pressed && { opacity: 0.85 }]}>
           {isPlaying ? (
             <Pause size={28} color={colors.onAccent} />
@@ -118,6 +129,7 @@ export default function PlayerScreen() {
           onPress={next}
           disabled={!hasNext}
           hitSlop={12}
+          accessibilityLabel="Siguiente"
           style={({ pressed }) => [!hasNext && { opacity: 0.3 }, pressed && { opacity: 0.6 }]}>
           <SkipNext size={30} />
         </Pressable>
@@ -125,6 +137,13 @@ export default function PlayerScreen() {
         <Pressable
           onPress={cycleRepeat}
           hitSlop={12}
+          accessibilityLabel={
+            repeat === 'one'
+              ? 'Repetir: esta canción'
+              : repeat === 'all'
+                ? 'Repetir: todo'
+                : 'Repetir: desactivado'
+          }
           style={({ pressed }) => pressed && { opacity: 0.6 }}>
           {repeat === 'one' ? (
             <RepeatOne size={21} color={colors.accent} />

@@ -1,4 +1,5 @@
 import { setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
+import { useSQLiteContext } from 'expo-sqlite';
 import {
   createContext,
   useCallback,
@@ -10,8 +11,10 @@ import {
   type ReactNode,
 } from 'react';
 
-import type { Track } from '@/db';
+import { getPref, setPref, type Track } from '@/db';
 import { artworkUri, trackUri } from '@/downloads/storage';
+
+import { buildOrder, findPlayable, removeFromOrder, step, toggleShuffleOrder } from './queue';
 
 export type RepeatMode = 'off' | 'all' | 'one';
 
@@ -29,7 +32,11 @@ type PlayerContextValue = {
   hasNext: boolean;
   hasPrev: boolean;
 
-  play: (tracks: Track[], startIndex?: number) => void;
+  /**
+   * Reproduce `tracks` desde `startIndex`. `options.shuffle` fuerza el modo
+   * aleatorio (y lo deja fijado); sin él se respeta el que haya.
+   */
+  play: (tracks: Track[], startIndex?: number, options?: { shuffle?: boolean }) => void;
   toggle: () => void;
   next: () => void;
   prev: () => void;
@@ -39,43 +46,19 @@ type PlayerContextValue = {
   stop: () => void;
   /** Saca una canción de la cola si se borró de la biblioteca. */
   removeFromQueue: (trackId: string) => void;
+  /** Actualiza título/artista de una canción que esté en la cola. */
+  updateInQueue: (track: Track) => void;
 };
 
 const PlayerContext = createContext<PlayerContextValue | null>(null);
 
-/** Fisher–Yates sobre una copia. */
-function shuffled(indices: number[]): number[] {
-  const out = [...indices];
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [out[i], out[j]] = [out[j], out[i]];
-  }
-  return out;
-}
+const REPEAT_MODES: RepeatMode[] = ['off', 'all', 'one'];
 
-/**
- * Primera posición desde `from` (avanzando en `direction`) cuyo archivo siga en
- * disco. Devuelve null si no queda ninguna reproducible.
- *
- * Esta comprobación vive acá —y no en el efecto que carga el audio— a propósito:
- * saltar una pista implica cambiar estado, y hacerlo dentro de un efecto dispara
- * renders en cascada. Llamándola desde play/next/prev, que son manejadores de
- * eventos, el salto ocurre donde corresponde.
- */
-function findPlayable(
-  queue: Track[],
-  order: number[],
-  from: number,
-  direction: 1 | -1,
-): number | null {
-  for (let p = from; p >= 0 && p < order.length; p += direction) {
-    const track = queue[order[p]];
-    if (track && trackUri(track.file_name)) return p;
-  }
-  return null;
-}
+/** ¿Sigue en disco el archivo de esta canción? */
+const onDisk = (track: Track | undefined) => !!track && !!trackUri(track.file_name);
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
+  const database = useSQLiteContext();
   const player = useAudioPlayer(null, { updateInterval: 250 });
   const status = useAudioPlayerStatus(player);
 
@@ -101,6 +84,29 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       // Si falla, la reproducción en primer plano sigue funcionando.
     });
   }, []);
+
+  /* Aleatorio y repetición se recuerdan entre sesiones. */
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([getPref(database, 'player.shuffle'), getPref(database, 'player.repeat')])
+      .then(([savedShuffle, savedRepeat]) => {
+        if (cancelled) return;
+        if (savedShuffle != null) setShuffle(savedShuffle === '1');
+        if (REPEAT_MODES.includes(savedRepeat as RepeatMode)) setRepeat(savedRepeat as RepeatMode);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [database]);
+
+  const saveShuffle = useCallback(
+    (on: boolean) => {
+      setShuffle(on);
+      setPref(database, 'player.shuffle', on ? '1' : '0').catch(() => {});
+    },
+    [database],
+  );
 
   /**
    * Carga la pista actual en el reproductor.
@@ -147,19 +153,32 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     player.updateLockScreenMetadata({ title: current.title, artist: current.artist });
   }, [current, player]);
 
-  const advance = useCallback(
-    (direction: 1 | -1) => {
-      setPos((p) => {
-        let target = p + direction;
-        if (target < 0) return 0;
-        if (target >= order.length) {
-          if (repeat !== 'all') return p;
-          target = 0;
-        }
-        return findPlayable(queue, order, target, direction) ?? p;
-      });
+  /** Vuelve a empezar la canción cargada. */
+  const restart = useCallback(() => {
+    player.seekTo(0);
+    player.play();
+  }, [player]);
+
+  /**
+   * Salta a la siguiente/anterior canción reproducible.
+   *
+   * Si el salto cae en la misma posición (una cola de una sola canción con
+   * "repetir todo"), cambiar `pos` no cambiaría nada y el audio se quedaría
+   * parado al final: hay que reiniciarla a mano.
+   *
+   * Devuelve false si no había adónde ir.
+   */
+  const skip = useCallback(
+    (direction: 1 | -1): boolean => {
+      const target = step(order.length, pos, direction, repeat === 'all', (p) =>
+        onDisk(queue[order[p]]),
+      );
+      if (target === null) return false;
+      if (target === pos) restart();
+      else setPos(target);
+      return true;
     },
-    [queue, order, repeat],
+    [queue, order, pos, repeat, restart],
   );
 
   /**
@@ -167,12 +186,30 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
    *
    * Va por `addListener` y no por un efecto sobre `status.didJustFinish`: el
    * reproductor es un sistema externo, y reaccionar a él desde un callback de
-   * suscripción es el patrón correcto. `handled` evita el doble salto, porque
-   * didJustFinish sigue en true durante varias actualizaciones de status.
+   * suscripción es el patrón correcto.
+   *
+   * Se suscribe UNA vez y lee el estado vigente por ref. Resuscribirse en cada
+   * cambio de canción reiniciaba el `handled` que evita el doble salto
+   * —didJustFinish sigue en true durante varias actualizaciones de status—
+   * justo en el momento en que más falta hacía.
    */
+  const onFinishRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    onFinishRef.current = () => {
+      if (repeat === 'one') {
+        restart();
+        return;
+      }
+      if (!skip(1)) {
+        // Fin de la cola: queda la última canción cargada y en pausa al inicio.
+        player.pause();
+        player.seekTo(0);
+      }
+    };
+  }, [repeat, restart, skip, player]);
+
   useEffect(() => {
     let handled = false;
-
     const sub = player.addListener('playbackStatusUpdate', (s) => {
       if (!s.didJustFinish) {
         handled = false;
@@ -180,39 +217,36 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
       if (handled) return;
       handled = true;
-
-      if (repeat === 'one') {
-        player.seekTo(0);
-        player.play();
-        return;
-      }
-      if (pos + 1 >= order.length && repeat !== 'all') {
-        player.pause();
-        player.seekTo(0);
-        return;
-      }
-      advance(1);
+      onFinishRef.current();
     });
-
     return () => sub.remove();
-  }, [player, repeat, pos, order.length, advance]);
+  }, [player]);
 
   const play = useCallback(
-    (tracks: Track[], startIndex = 0) => {
+    (tracks: Track[], startIndex = 0, options?: { shuffle?: boolean }) => {
       if (!tracks.length) return;
-      const indices = tracks.map((_, i) => i);
+      const useShuffle = options?.shuffle ?? shuffle;
+      if (useShuffle !== shuffle) saveShuffle(useShuffle);
 
-      const nextOrder = shuffle
-        ? // La elegida arranca primero; el resto va revuelto detrás.
-          [startIndex, ...shuffled(indices.filter((i) => i !== startIndex))]
-        : indices;
-      const startPos = shuffle ? 0 : startIndex;
+      const built = buildOrder(tracks.length, startIndex, useShuffle);
+      const startPos =
+        findPlayable(built.order.length, built.pos, 1, (p) => onDisk(tracks[built.order[p]])) ??
+        built.pos;
 
       setQueue(tracks);
-      setOrder(nextOrder);
-      setPos(findPlayable(tracks, nextOrder, startPos, 1) ?? startPos);
+      setOrder(built.order);
+      setPos(startPos);
+
+      // Tocar la canción que ya está cargada no cambia `current`, así que el
+      // efecto de carga no hace nada: si estaba en pausa (o terminada) hay que
+      // reanudarla aquí, o el toque no produce ningún sonido.
+      const chosen = tracks[built.order[startPos]];
+      if (chosen && chosen.id === loadedIdRef.current && !status.playing) {
+        if (status.duration > 0 && status.currentTime >= status.duration - 0.5) player.seekTo(0);
+        player.play();
+      }
     },
-    [shuffle],
+    [shuffle, saveShuffle, status.playing, status.currentTime, status.duration, player],
   );
 
   const toggle = useCallback(() => {
@@ -221,16 +255,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     else player.play();
   }, [current, status.playing, player]);
 
-  const next = useCallback(() => advance(1), [advance]);
+  const next = useCallback(() => {
+    skip(1);
+  }, [skip]);
 
   /** Antes de 4 s vuelve al inicio de la canción; después salta a la anterior. */
   const prev = useCallback(() => {
-    if (status.currentTime > 4) {
-      player.seekTo(0);
-      return;
-    }
-    advance(-1);
-  }, [status.currentTime, player, advance]);
+    if (status.currentTime > 4 || !skip(-1)) player.seekTo(0);
+  }, [status.currentTime, player, skip]);
 
   const seekTo = useCallback(
     (seconds: number) => {
@@ -241,25 +273,18 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const toggleShuffle = useCallback(() => {
     const turningOn = !shuffle;
-    setShuffle(turningOn);
-
+    saveShuffle(turningOn);
     if (!order.length) return;
-    const currentIdx = order[pos];
-
-    if (turningOn) {
-      setOrder([currentIdx, ...shuffled(order.filter((i) => i !== currentIdx))]);
-      setPos(0);
-    } else {
-      // Al desactivar volvemos al orden natural, sin perder dónde vamos.
-      const natural = [...order].sort((a, b) => a - b);
-      setOrder(natural);
-      setPos(natural.indexOf(currentIdx));
-    }
-  }, [shuffle, order, pos]);
+    const reordered = toggleShuffleOrder(order, pos, turningOn);
+    setOrder(reordered.order);
+    setPos(reordered.pos);
+  }, [shuffle, saveShuffle, order, pos]);
 
   const cycleRepeat = useCallback(() => {
-    setRepeat((r) => (r === 'off' ? 'all' : r === 'all' ? 'one' : 'off'));
-  }, []);
+    const nextMode = REPEAT_MODES[(REPEAT_MODES.indexOf(repeat) + 1) % REPEAT_MODES.length];
+    setRepeat(nextMode);
+    setPref(database, 'player.repeat', nextMode).catch(() => {});
+  }, [repeat, database]);
 
   const stop = useCallback(() => {
     player.pause();
@@ -275,24 +300,23 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const removedIdx = queue.findIndex((t) => t.id === trackId);
       if (removedIdx === -1) return;
 
-      const currentIdx = order[pos];
-      // Reindexamos: los índices por encima del borrado se corren uno abajo.
-      const nextOrder = order
-        .filter((i) => i !== removedIdx)
-        .map((i) => (i > removedIdx ? i - 1 : i));
-
+      const reordered = removeFromOrder(order, pos, removedIdx);
       setQueue(queue.filter((t) => t.id !== trackId));
-      setOrder(nextOrder);
-
-      if (currentIdx === removedIdx) {
-        setPos(Math.min(pos, Math.max(0, nextOrder.length - 1)));
-      } else {
-        const adjusted = currentIdx > removedIdx ? currentIdx - 1 : currentIdx;
-        setPos(Math.max(0, nextOrder.indexOf(adjusted)));
-      }
+      setOrder(reordered.order);
+      setPos(reordered.pos);
     },
     [queue, order, pos],
   );
+
+  /**
+   * Refleja en la cola un cambio de título/artista, para que el mini
+   * reproductor y la pantalla bloqueada no sigan mostrando el nombre viejo.
+   */
+  const updateInQueue = useCallback((track: Track) => {
+    setQueue((q) =>
+      q.some((t) => t.id === track.id) ? q.map((t) => (t.id === track.id ? track : t)) : q,
+    );
+  }, []);
 
   const value = useMemo<PlayerContextValue>(
     () => ({
@@ -304,8 +328,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       duration: status.duration || current?.duration || 0,
       shuffle,
       repeat,
-      hasNext: pos + 1 < order.length || repeat === 'all',
-      hasPrev: pos > 0,
+      hasNext: pos + 1 < order.length || (repeat === 'all' && order.length > 0),
+      hasPrev: pos > 0 || (repeat === 'all' && order.length > 1),
       play,
       toggle,
       next,
@@ -315,11 +339,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       cycleRepeat,
       stop,
       removeFromQueue,
+      updateInQueue,
     }),
     [
       current, queue, status.playing, status.isBuffering, status.currentTime, status.duration,
       shuffle, repeat, pos, order.length,
       play, toggle, next, prev, seekTo, toggleShuffle, cycleRepeat, stop, removeFromQueue,
+      updateInQueue,
     ],
   );
 

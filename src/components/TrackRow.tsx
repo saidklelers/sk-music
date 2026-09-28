@@ -69,6 +69,7 @@ export const TrackRow = memo(function TrackRow({
         <Pressable
           onPress={onMenu}
           hitSlop={10}
+          accessibilityLabel={`Opciones de ${track.title}`}
           style={({ pressed }) => [styles.menu, pressed && { opacity: 0.5 }]}>
           <MoreVertical size={18} color={colors.textFaint} />
         </Pressable>

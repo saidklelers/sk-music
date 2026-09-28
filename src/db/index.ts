@@ -62,6 +62,35 @@ export async function migrate(db: SQLite.SQLiteDatabase) {
       PRAGMA user_version = 1;
     `);
   }
+
+  if (version < 2) {
+    // Preferencias sueltas (orden de la biblioteca, aleatorio, repetición).
+    // Clave/valor en texto: son pocas y no merecen una columna cada una.
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS prefs (
+        key   TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL
+      );
+
+      PRAGMA user_version = 2;
+    `);
+  }
+}
+
+/* ------------------------------ preferencias ----------------------------- */
+
+export async function getPref(db: SQLite.SQLiteDatabase, key: string): Promise<string | null> {
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM prefs WHERE key = ?', [
+    key,
+  ]);
+  return row?.value ?? null;
+}
+
+export async function setPref(db: SQLite.SQLiteDatabase, key: string, value: string) {
+  await db.runAsync(
+    'INSERT INTO prefs (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    [key, value],
+  );
 }
 
 /* ------------------------------- canciones ------------------------------- */

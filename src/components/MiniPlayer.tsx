@@ -31,6 +31,7 @@ export function MiniPlayer() {
 
       <Pressable
         onPress={() => router.push('/player')}
+        accessibilityLabel={`Abrir reproductor: ${current.title}`}
         style={({ pressed }) => [styles.body, pressed && { opacity: 0.75 }]}>
         <Artwork uri={artworkUri(current.artwork_name)} size={40} />
 
@@ -46,6 +47,7 @@ export function MiniPlayer() {
         <Pressable
           onPress={toggle}
           hitSlop={12}
+          accessibilityLabel={isPlaying ? 'Pausar' : 'Reproducir'}
           style={({ pressed }) => pressed && { opacity: 0.6 }}>
           {isPlaying ? <Pause size={22} /> : <Play size={22} />}
         </Pressable>
@@ -54,6 +56,7 @@ export function MiniPlayer() {
           onPress={next}
           disabled={!hasNext}
           hitSlop={12}
+          accessibilityLabel="Siguiente"
           style={({ pressed }) => [!hasNext && { opacity: 0.3 }, pressed && { opacity: 0.6 }]}>
           <SkipNext size={20} />
         </Pressable>
