@@ -36,6 +36,12 @@ jobs:
           java-version: 17
 
       - uses: android-actions/setup-android@v3
+        with:
+          # Por defecto instala `tools platform-tools`, pero `tools` es un
+          # paquete heredado que las cmdline-tools 16 del runner ya no
+          # ofrecen: sdkmanager falla y tumba la build. Gradle sólo necesita
+          # platform-tools; lo demás lo descarga él.
+          packages: platform-tools
 
       - name: Instalar dependencias
         run: npm ci
