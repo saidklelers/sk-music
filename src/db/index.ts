@@ -90,11 +90,28 @@ export async function trackExists(db: SQLite.SQLiteDatabase, id: string): Promis
   return (row?.n ?? 0) > 0;
 }
 
+/**
+ * Inserta o actualiza una canción.
+ *
+ * Es un UPSERT y no `INSERT OR REPLACE` a propósito: REPLACE resuelve el
+ * conflicto BORRANDO la fila vieja, y ese borrado dispara el `ON DELETE
+ * CASCADE` de `playlist_tracks`. Volver a descargar una canción la sacaba en
+ * silencio de todas sus listas.
+ *
+ * Al re-descargar sólo se renueva lo que depende del archivo. Título, artista
+ * y `added_at` se conservan: el usuario pudo haberlos editado, y una
+ * re-descarga no es una canción nueva que deba saltar al principio.
+ */
 export async function insertTrack(db: SQLite.SQLiteDatabase, track: Track) {
   await db.runAsync(
-    `INSERT OR REPLACE INTO tracks
+    `INSERT INTO tracks
        (id, title, artist, duration, file_name, artwork_name, size, added_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       duration     = excluded.duration,
+       file_name    = excluded.file_name,
+       artwork_name = excluded.artwork_name,
+       size         = excluded.size`,
     [
       track.id,
       track.title,
