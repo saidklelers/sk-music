@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -20,11 +21,12 @@ import { downloads, type DownloadJob } from '@/downloads/manager';
 import { useLibrary } from '@/library/LibraryProvider';
 import { formatDuration } from '@/lib/format';
 import { colors, layout, radius, space, type } from '@/theme';
-import { parseVideoId, searchTracks, type SearchResult } from '@/youtube/resolve';
+import { searchTracks, type SearchResult } from '@/youtube/resolve';
+import { parseVideoId } from '@/youtube/videoId';
 
 export default function AddScreen() {
   const insets = useSafeAreaInsets();
-  const { jobs, downloadedIds } = useLibrary();
+  const { jobs, downloadedIds, tracks } = useLibrary();
 
   const [input, setInput] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -40,11 +42,25 @@ export default function AddScreen() {
     const value = input.trim();
     if (!value) return;
 
-    if (parseVideoId(value)) {
-      downloads.enqueue(value);
-      setInput('');
-      setResults([]);
-      setSearchError(null);
+    const videoId = parseVideoId(value);
+    if (videoId) {
+      const start = () => {
+        downloads.enqueue(value);
+        setInput('');
+        setResults([]);
+        setSearchError(null);
+      };
+      // Volver a bajar algo que ya está suele ser un despiste, pero a veces es
+      // a propósito (un archivo dañado): se pregunta en vez de decidir.
+      const existing = tracks.find((t) => t.id === videoId);
+      if (existing) {
+        Alert.alert('Ya está en tu biblioteca', `"${existing.title}" ya está descargada.`, [
+          { text: 'Cancelar', style: 'cancel' },
+          { text: 'Descargar de nuevo', onPress: start },
+        ]);
+        return;
+      }
+      start();
       return;
     }
 
@@ -58,7 +74,7 @@ export default function AddScreen() {
     } finally {
       setSearching(false);
     }
-  }, [input]);
+  }, [input, tracks]);
 
   const activeJobs = jobs.filter((j) => j.status === 'resolving' || j.status === 'downloading');
   const finishedJobs = jobs.filter((j) => j.status !== 'resolving' && j.status !== 'downloading');

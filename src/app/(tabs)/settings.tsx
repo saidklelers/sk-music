@@ -14,13 +14,14 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Logo } from '@/components/Logo';
 import { ScreenHeader, SectionLabel } from '@/components/Primitives';
+import { downloads } from '@/downloads/manager';
 import { availableSpace, pruneOrphans } from '@/downloads/storage';
 import { useLibrary } from '@/library/LibraryProvider';
 import { formatBytes, pluralTracks } from '@/lib/format';
 import { colors, layout, radius, space, type } from '@/theme';
 import { diagnose } from '@/youtube/diagnose';
 import { resetInnertube } from '@/youtube/innertube';
-import { parseVideoId } from '@/youtube/resolve';
+import { parseVideoId } from '@/youtube/videoId';
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
@@ -61,6 +62,7 @@ export default function SettingsScreen() {
       const freed = pruneOrphans(
         tracks.map((t) => t.file_name),
         tracks.map((t) => t.artwork_name).filter((n): n is string => !!n),
+        downloads.activeIds(),
       );
       await refresh();
       Alert.alert(

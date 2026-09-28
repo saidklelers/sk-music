@@ -26,6 +26,15 @@ export function artworkFile(fileName: string): File {
   return new File(artworkDir, fileName);
 }
 
+/**
+ * Archivo temporal donde se escribe una descarga en curso. Sólo al terminar
+ * completa se renombra al nombre definitivo, así un archivo con el nombre final
+ * nunca está a medias.
+ */
+export function partialFile(fileName: string): File {
+  return new File(tracksDir, `${fileName}.part`);
+}
+
 /** URI absoluta del audio, o null si el archivo se perdió. */
 export function trackUri(fileName: string): string | null {
   const f = trackFile(fileName);
@@ -65,16 +74,26 @@ export function availableSpace(): number {
 /**
  * Elimina audio y carátulas que ya no están referenciados en la base de datos
  * (descargas interrumpidas, borrados a medias). Devuelve los bytes liberados.
+ *
+ * `busyIds` son los videos que se están descargando ahora mismo: sus archivos
+ * todavía no están en la base, pero no son huérfanos sino trabajo en curso.
  */
-export function pruneOrphans(knownTracks: string[], knownArtwork: string[]): number {
+export function pruneOrphans(
+  knownTracks: string[],
+  knownArtwork: string[],
+  busyIds: string[] = [],
+): number {
   ensureDirs();
   const keepTracks = new Set(knownTracks);
   const keepArtwork = new Set(knownArtwork);
   let freed = 0;
 
+  // Los archivos se nombran `<id>.<ext>` (y `<id>.<ext>.part` a medias).
+  const isBusy = (name: string) => busyIds.includes(name.split('.')[0]);
+
   const sweep = (dir: Directory, keep: Set<string>) => {
     for (const item of dir.list()) {
-      if (item instanceof File && !keep.has(item.name)) {
+      if (item instanceof File && !keep.has(item.name) && !isBusy(item.name)) {
         freed += item.size ?? 0;
         try {
           item.delete();

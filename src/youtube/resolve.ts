@@ -1,6 +1,7 @@
 import type { Innertube } from 'youtubei.js';
 
 import { getInnertube, isCold, resetInnertube } from './innertube';
+import { isVideoId, parseVideoId } from './videoId';
 
 /** Etapas de la resolución, para poder mostrar en qué punto va o dónde falló. */
 export type ResolveStage = 'session' | 'metadata' | 'format';
@@ -121,45 +122,6 @@ function withTimeout<T>(promise: Promise<T>, stage: ResolveStage): Promise<T> {
       },
     );
   });
-}
-
-/**
- * Extrae el ID de video de cualquier forma de link de YouTube:
- * youtu.be/ID, /watch?v=ID, /shorts/ID, /embed/ID, /live/ID, music.youtube.com,
- * o directamente un ID de 11 caracteres pegado a mano.
- */
-export function parseVideoId(input: string): string | null {
-  const raw = input.trim();
-  if (!raw) return null;
-
-  if (/^[\w-]{11}$/.test(raw)) return raw;
-
-  let url: URL;
-  try {
-    url = new URL(raw.startsWith('http') ? raw : `https://${raw}`);
-  } catch {
-    return null;
-  }
-
-  const host = url.hostname.replace(/^www\./, '');
-  const isYouTube =
-    host === 'youtu.be' ||
-    host === 'youtube.com' ||
-    host === 'm.youtube.com' ||
-    host === 'music.youtube.com' ||
-    host.endsWith('.youtube.com');
-  if (!isYouTube) return null;
-
-  if (host === 'youtu.be') {
-    const id = url.pathname.slice(1).split('/')[0];
-    return /^[\w-]{11}$/.test(id) ? id : null;
-  }
-
-  const v = url.searchParams.get('v');
-  if (v && /^[\w-]{11}$/.test(v)) return v;
-
-  const m = url.pathname.match(/^\/(?:shorts|embed|live|v)\/([\w-]{11})/);
-  return m ? m[1] : null;
 }
 
 /** Toma la miniatura de mayor resolución disponible. */
@@ -338,7 +300,7 @@ export async function searchTracks(query: string, limit = 20): Promise<SearchRes
         thumbnails?: { url: string; width: number }[];
       };
       const videoId = node.id ?? node.video_id;
-      if (!videoId || !/^[\w-]{11}$/.test(videoId)) continue;
+      if (!videoId || !isVideoId(videoId)) continue;
 
       out.push({
         id: videoId,
