@@ -114,6 +114,13 @@ export const Trash = (p: IconProps) => (
 
 export const Plus = (p: IconProps) => <Stroked {...p} d="M12 5v14M5 12h14" />;
 
+export const Edit = (p: IconProps) => (
+  <Stroked {...p} d="M4.5 19.5h4l10.2-10.2a2.1 2.1 0 0 0-3-3L5.5 16.5l-1 3ZM14 7.8l2.2 2.2" />
+);
+
+/** Líneas de largo decreciente: la forma habitual de "ordenar". */
+export const Sort = (p: IconProps) => <Stroked {...p} d="M4.5 7h15M7 12h10M9.5 17h5" />;
+
 export const Check = (p: IconProps) => <Stroked {...p} d="m4.5 12.5 5 5 10-11" />;
 
 export const X = (p: IconProps) => <Stroked {...p} d="M6 6l12 12M18 6 6 18" />;

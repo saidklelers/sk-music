@@ -205,6 +205,10 @@ export async function createPlaylist(db: SQLite.SQLiteDatabase, name: string): P
   return res.lastInsertRowId;
 }
 
+export async function renamePlaylist(db: SQLite.SQLiteDatabase, id: number, name: string) {
+  await db.runAsync('UPDATE playlists SET name = ? WHERE id = ?', [name.trim(), id]);
+}
+
 export async function deletePlaylist(db: SQLite.SQLiteDatabase, id: number) {
   await db.runAsync('DELETE FROM playlists WHERE id = ?', [id]);
 }

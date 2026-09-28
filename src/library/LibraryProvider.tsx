@@ -29,6 +29,7 @@ type LibraryContextValue = {
   rename: (id: string, title: string, artist: string) => Promise<void>;
 
   newPlaylist: (name: string) => Promise<number>;
+  renamePlaylist: (id: number, name: string) => Promise<void>;
   removePlaylist: (id: number) => Promise<void>;
   addTrackToPlaylist: (playlistId: number, trackId: string) => Promise<void>;
   removeTrackFromPlaylist: (playlistId: number, trackId: string) => Promise<void>;
@@ -49,7 +50,7 @@ const LibraryContext = createContext<LibraryContextValue | null>(null);
  */
 export function LibraryProvider({ children }: { children: ReactNode }) {
   const database = useSQLiteContext();
-  const { removeFromQueue } = usePlayer();
+  const { removeFromQueue, updateInQueue } = usePlayer();
 
   const [tracks, setTracks] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
@@ -133,9 +134,11 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   const rename = useCallback(
     async (id: string, title: string, artist: string) => {
       await db.renameTrack(database, id, title.trim() || 'Sin título', artist.trim() || 'Desconocido');
+      const updated = await db.getTrack(database, id);
+      if (updated) updateInQueue(updated);
       await refresh();
     },
-    [database, refresh],
+    [database, refresh, updateInQueue],
   );
 
   const newPlaylist = useCallback(
@@ -143,6 +146,15 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       const id = await db.createPlaylist(database, name);
       await refresh();
       return id;
+    },
+    [database, refresh],
+  );
+
+  const renamePlaylist = useCallback(
+    async (id: number, name: string) => {
+      if (!name.trim()) return;
+      await db.renamePlaylist(database, id, name);
+      await refresh();
     },
     [database, refresh],
   );
@@ -196,6 +208,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       removeTrack,
       rename,
       newPlaylist,
+      renamePlaylist,
       removePlaylist,
       addTrackToPlaylist,
       removeTrackFromPlaylist,
@@ -204,7 +217,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
     }),
     [
       tracks, playlists, jobs, loading, downloadedIds, librarySize, refresh,
-      removeTrack, rename, newPlaylist, removePlaylist, addTrackToPlaylist,
+      removeTrack, rename, newPlaylist, renamePlaylist, removePlaylist, addTrackToPlaylist,
       removeTrackFromPlaylist, tracksOfPlaylist, playlistsWithTrack,
     ],
   );

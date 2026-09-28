@@ -1,5 +1,14 @@
 import type { ReactNode } from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { colors, radius, space, type } from '@/theme';
@@ -18,6 +27,10 @@ type SheetProps = {
  * Se prefiere esto a `Alert.alert` con botones porque Alert se ve distinto en
  * cada sistema y no admite la paleta. Aquí el aspecto es idéntico en Android e
  * iOS y consistente con el resto de la app.
+ *
+ * La hoja va dentro de un KeyboardAvoidingView: en iOS el teclado no empuja
+ * nada por sí solo y tapaba los campos de texto de las hojas con formulario.
+ * En Android la ventana del Modal ya se redimensiona sola.
  */
 export function Sheet({ visible, onClose, title, subtitle, children }: SheetProps) {
   const insets = useSafeAreaInsets();
@@ -30,24 +43,30 @@ export function Sheet({ visible, onClose, title, subtitle, children }: SheetProp
       statusBarTranslucent
       onRequestClose={onClose}>
       <Pressable style={styles.backdrop} onPress={onClose} />
-      <View style={[styles.sheet, { paddingBottom: insets.bottom + space.md }]}>
-        <View style={styles.grabber} />
-        {!!title && (
-          <View style={styles.head}>
-            <Text style={styles.title} numberOfLines={2}>
-              {title}
-            </Text>
-            {!!subtitle && (
-              <Text style={styles.subtitle} numberOfLines={1}>
-                {subtitle}
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={styles.avoider}>
+        <View style={[styles.sheet, { paddingBottom: insets.bottom + space.md }]}>
+          <View style={styles.grabber} />
+          {!!title && (
+            <View style={styles.head}>
+              <Text style={styles.title} numberOfLines={2}>
+                {title}
               </Text>
-            )}
-          </View>
-        )}
-        <ScrollView bounces={false} style={{ maxHeight: 420 }}>
-          {children}
-        </ScrollView>
-      </View>
+              {!!subtitle && (
+                <Text style={styles.subtitle} numberOfLines={1}>
+                  {subtitle}
+                </Text>
+              )}
+            </View>
+          )}
+          {/* `handled`: con el teclado abierto, el primer toque en un botón de
+              la hoja tiene que pulsarlo, no sólo cerrar el teclado. */}
+          <ScrollView bounces={false} keyboardShouldPersistTaps="handled" style={styles.body}>
+            {children}
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -88,11 +107,15 @@ const styles = StyleSheet.create({
     bottom: 0,
     backgroundColor: colors.scrim,
   },
+  /* Ocupa toda la pantalla para poder empujar la hoja hacia arriba, pero deja
+     pasar los toques del hueco vacío al fondo, que es el que cierra. */
+  avoider: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    pointerEvents: 'box-none',
+  },
+  body: { maxHeight: 420 },
   sheet: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
     backgroundColor: colors.surface,
     borderTopLeftRadius: radius.xl,
     borderTopRightRadius: radius.xl,

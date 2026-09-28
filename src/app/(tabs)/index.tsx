@@ -1,5 +1,6 @@
 import { useRouter } from 'expo-router';
-import { useCallback, useMemo, useState } from 'react';
+import { useSQLiteContext } from 'expo-sqlite';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   FlatList,
@@ -11,13 +12,27 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { Check, ChevronRight, Music, Plus, Search, Trash, X } from '@/components/Icons';
+import {
+  Check,
+  ChevronRight,
+  Edit,
+  Music,
+  Play,
+  Plus,
+  Search,
+  Shuffle,
+  Sort,
+  Trash,
+  X,
+} from '@/components/Icons';
 import { EmptyState, ScreenHeader } from '@/components/Primitives';
+import { PromptSheet } from '@/components/PromptSheet';
 import { Sheet, SheetItem } from '@/components/Sheet';
 import { TrackRow } from '@/components/TrackRow';
-import type { Track } from '@/db';
+import { getPref, setPref, type Playlist, type Track } from '@/db';
 import { useLibrary } from '@/library/LibraryProvider';
 import { formatBytes, pluralTracks } from '@/lib/format';
+import { SORT_LABEL, SORT_MODES, sortTracks, type SortMode } from '@/lib/sort';
 import { usePlayer } from '@/player/PlayerProvider';
 import { colors, layout, radius, space, type } from '@/theme';
 
@@ -26,12 +41,15 @@ type Tab = 'songs' | 'lists';
 export default function LibraryScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const database = useSQLiteContext();
   const {
     tracks,
     playlists,
     librarySize,
     removeTrack,
+    rename,
     newPlaylist,
+    renamePlaylist,
     removePlaylist,
     addTrackToPlaylist,
     playlistsWithTrack,
@@ -40,21 +58,56 @@ export default function LibraryScreen() {
 
   const [tab, setTab] = useState<Tab>('songs');
   const [query, setQuery] = useState('');
+  const [sort, setSort] = useState<SortMode>('recent');
+  const [sortOpen, setSortOpen] = useState(false);
+
   const [menuTrack, setMenuTrack] = useState<Track | null>(null);
+  const [editTrack, setEditTrack] = useState<Track | null>(null);
   const [playlistPickerFor, setPlaylistPickerFor] = useState<Track | null>(null);
   const [memberOf, setMemberOf] = useState<number[]>([]);
-  const [creating, setCreating] = useState(false);
-  const [newName, setNewName] = useState('');
 
-  // Filtrado en memoria: con bibliotecas de este tamaño ir a SQLite en cada
-  // tecla sólo agrega latencia.
-  const filtered = useMemo(() => {
+  /**
+   * Crear lista. Si se abre desde el selector, recuerda qué canción había que
+   * meter: el selector se cierra antes de abrir esta hoja, porque dos Modal
+   * hermanos visibles a la vez no se presentan en iOS.
+   */
+  const [creating, setCreating] = useState<{ addTrack: Track | null } | null>(null);
+  const [menuPlaylist, setMenuPlaylist] = useState<Playlist | null>(null);
+  const [renaming, setRenaming] = useState<Playlist | null>(null);
+
+  /* El orden elegido se recuerda entre sesiones. */
+  useEffect(() => {
+    let cancelled = false;
+    getPref(database, 'library.sort')
+      .then((saved) => {
+        if (!cancelled && SORT_MODES.includes(saved as SortMode)) setSort(saved as SortMode);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [database]);
+
+  const chooseSort = useCallback(
+    (mode: SortMode) => {
+      setSort(mode);
+      setSortOpen(false);
+      setPref(database, 'library.sort', mode).catch(() => {});
+    },
+    [database],
+  );
+
+  // Filtrado y orden en memoria: con bibliotecas de este tamaño ir a SQLite en
+  // cada tecla sólo agrega latencia.
+  const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return tracks;
-    return tracks.filter(
-      (t) => t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q),
-    );
-  }, [tracks, query]);
+    const filtered = q
+      ? tracks.filter(
+          (t) => t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q),
+        )
+      : tracks;
+    return sortTracks(filtered, sort);
+  }, [tracks, query, sort]);
 
   const openPlaylistPicker = useCallback(
     async (track: Track) => {
@@ -81,27 +134,28 @@ export default function LibraryScreen() {
   );
 
   const confirmDeletePlaylist = useCallback(
-    (id: number, name: string) => {
-      Alert.alert('Eliminar lista', `Se borrará "${name}". Las canciones se conservan.`, [
+    (playlist: Playlist) => {
+      setMenuPlaylist(null);
+      Alert.alert('Eliminar lista', `Se borrará "${playlist.name}". Las canciones se conservan.`, [
         { text: 'Cancelar', style: 'cancel' },
-        { text: 'Eliminar', style: 'destructive', onPress: () => void removePlaylist(id) },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => void removePlaylist(playlist.id),
+        },
       ]);
     },
     [removePlaylist],
   );
 
-  const createPlaylist = useCallback(async () => {
-    const name = newName.trim();
-    if (!name) return;
-    const id = await newPlaylist(name);
-    setNewName('');
-    setCreating(false);
-    // Si veníamos de "agregar a lista", metemos la canción de una vez.
-    if (playlistPickerFor) {
-      await addTrackToPlaylist(id, playlistPickerFor.id);
-      setMemberOf((m) => [...m, id]);
-    }
-  }, [newName, newPlaylist, playlistPickerFor, addTrackToPlaylist]);
+  const createPlaylist = useCallback(
+    async ({ name }: Record<string, string>) => {
+      const id = await newPlaylist(name);
+      // Si veníamos de "agregar a lista", metemos la canción de una vez.
+      if (creating?.addTrack) await addTrackToPlaylist(id, creating.addTrack.id);
+    },
+    [newPlaylist, addTrackToPlaylist, creating],
+  );
 
   const bottomPad = layout.miniPlayerHeight + space.xl;
 
@@ -113,6 +167,18 @@ export default function LibraryScreen() {
           tracks.length
             ? `${pluralTracks(tracks.length)} · ${formatBytes(librarySize)}`
             : 'Todo lo que descargues vive aquí'
+        }
+        right={
+          tab === 'songs' && tracks.length > 1 ? (
+            <Pressable
+              onPress={() => setSortOpen(true)}
+              hitSlop={10}
+              accessibilityLabel={`Ordenar: ${SORT_LABEL[sort]}`}
+              style={({ pressed }) => [styles.sortBtn, pressed && { opacity: 0.6 }]}>
+              <Sort size={18} color={colors.textMuted} />
+              <Text style={styles.sortText}>{SORT_LABEL[sort]}</Text>
+            </Pressable>
+          ) : undefined
         }
       />
 
@@ -152,15 +218,43 @@ export default function LibraryScreen() {
           )}
 
           <FlatList
-            data={filtered}
+            data={visible}
             keyExtractor={(t) => t.id}
             contentContainerStyle={{ paddingBottom: bottomPad }}
             keyboardShouldPersistTaps="handled"
+            ListHeaderComponent={
+              visible.length > 1 ? (
+                <View style={styles.playRow}>
+                  <Pressable
+                    onPress={() => play(visible, 0, { shuffle: false })}
+                    style={({ pressed }) => [
+                      styles.playBtn,
+                      styles.playBtnPrimary,
+                      pressed && { opacity: 0.8 },
+                    ]}>
+                    <Play size={16} color={colors.onAccent} />
+                    <Text style={[styles.playBtnText, { color: colors.onAccent }]}>
+                      Reproducir
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() =>
+                      play(visible, Math.floor(Math.random() * visible.length), {
+                        shuffle: true,
+                      })
+                    }
+                    style={({ pressed }) => [styles.playBtn, pressed && { opacity: 0.8 }]}>
+                    <Shuffle size={16} color={colors.text} />
+                    <Text style={styles.playBtnText}>Aleatorio</Text>
+                  </Pressable>
+                </View>
+              ) : null
+            }
             renderItem={({ item, index }) => (
               <TrackRow
                 track={item}
                 active={current?.id === item.id}
-                onPress={() => play(filtered, index)}
+                onPress={() => play(visible, index)}
                 onLongPress={() => setMenuTrack(item)}
                 onMenu={() => setMenuTrack(item)}
               />
@@ -186,7 +280,7 @@ export default function LibraryScreen() {
           contentContainerStyle={{ paddingBottom: bottomPad }}
           ListHeaderComponent={
             <Pressable
-              onPress={() => setCreating(true)}
+              onPress={() => setCreating({ addTrack: null })}
               style={({ pressed }) => [styles.newListRow, pressed && { opacity: 0.7 }]}>
               <View style={styles.newListIcon}>
                 <Plus size={20} color={colors.accent} />
@@ -197,7 +291,7 @@ export default function LibraryScreen() {
           renderItem={({ item }) => (
             <Pressable
               onPress={() => router.push(`/playlist/${item.id}`)}
-              onLongPress={() => confirmDeletePlaylist(item.id, item.name)}
+              onLongPress={() => setMenuPlaylist(item)}
               style={({ pressed }) => [styles.listRow, pressed && { backgroundColor: colors.surface }]}>
               <View style={styles.listIcon}>
                 <Music size={20} color={colors.textMuted} />
@@ -219,6 +313,18 @@ export default function LibraryScreen() {
         />
       )}
 
+      {/* Orden */}
+      <Sheet visible={sortOpen} onClose={() => setSortOpen(false)} title="Ordenar por">
+        {SORT_MODES.map((mode) => (
+          <SheetItem
+            key={mode}
+            label={SORT_LABEL[mode]}
+            trailing={sort === mode ? <Check size={18} color={colors.accent} /> : undefined}
+            onPress={() => chooseSort(mode)}
+          />
+        ))}
+      </Sheet>
+
       {/* Menú de canción */}
       <Sheet
         visible={!!menuTrack}
@@ -233,6 +339,14 @@ export default function LibraryScreen() {
               onPress={() => void openPlaylistPicker(menuTrack)}
             />
             <SheetItem
+              label="Editar título y artista"
+              icon={<Edit size={20} color={colors.textMuted} />}
+              onPress={() => {
+                setMenuTrack(null);
+                setEditTrack(menuTrack);
+              }}
+            />
+            <SheetItem
               label="Eliminar del dispositivo"
               icon={<Trash size={20} color={colors.danger} />}
               danger
@@ -241,6 +355,21 @@ export default function LibraryScreen() {
           </>
         )}
       </Sheet>
+
+      {/* Editar canción */}
+      <PromptSheet
+        visible={!!editTrack}
+        onClose={() => setEditTrack(null)}
+        title="Editar canción"
+        confirmLabel="Guardar"
+        fields={[
+          { key: 'title', label: 'Título', initial: editTrack?.title, required: true },
+          { key: 'artist', label: 'Artista', initial: editTrack?.artist },
+        ]}
+        onSubmit={async ({ title, artist }) => {
+          if (editTrack) await rename(editTrack.id, title, artist);
+        }}
+      />
 
       {/* Selector de lista */}
       <Sheet
@@ -251,7 +380,10 @@ export default function LibraryScreen() {
         <SheetItem
           label="Nueva lista"
           icon={<Plus size={20} color={colors.accent} />}
-          onPress={() => setCreating(true)}
+          onPress={() => {
+            setCreating({ addTrack: playlistPickerFor });
+            setPlaylistPickerFor(null);
+          }}
         />
         {playlists.map((p) => {
           const already = memberOf.includes(p.id);
@@ -272,36 +404,67 @@ export default function LibraryScreen() {
       </Sheet>
 
       {/* Crear lista */}
-      <Sheet visible={creating} onClose={() => setCreating(false)} title="Nueva lista">
-        <View style={styles.createBox}>
-          <TextInput
-            value={newName}
-            onChangeText={setNewName}
-            placeholder="Nombre de la lista"
-            placeholderTextColor={colors.textFaint}
-            style={styles.createInput}
-            autoFocus
-            returnKeyType="done"
-            onSubmitEditing={() => void createPlaylist()}
-          />
-          <Pressable
-            onPress={() => void createPlaylist()}
-            disabled={!newName.trim()}
-            style={({ pressed }) => [
-              styles.createBtn,
-              !newName.trim() && { opacity: 0.4 },
-              pressed && { opacity: 0.7 },
-            ]}>
-            <Check size={20} color={colors.onAccent} />
-          </Pressable>
-        </View>
+      <PromptSheet
+        visible={!!creating}
+        onClose={() => setCreating(null)}
+        title="Nueva lista"
+        subtitle={creating?.addTrack ? `Con “${creating.addTrack.title}”` : undefined}
+        confirmLabel="Crear"
+        fields={[{ key: 'name', placeholder: 'Nombre de la lista', required: true }]}
+        onSubmit={createPlaylist}
+      />
+
+      {/* Menú de lista */}
+      <Sheet
+        visible={!!menuPlaylist}
+        onClose={() => setMenuPlaylist(null)}
+        title={menuPlaylist?.name}
+        subtitle={menuPlaylist ? pluralTracks(menuPlaylist.track_count) : undefined}>
+        {menuPlaylist && (
+          <>
+            <SheetItem
+              label="Renombrar"
+              icon={<Edit size={20} color={colors.textMuted} />}
+              onPress={() => {
+                setMenuPlaylist(null);
+                setRenaming(menuPlaylist);
+              }}
+            />
+            <SheetItem
+              label="Eliminar lista"
+              icon={<Trash size={20} color={colors.danger} />}
+              danger
+              onPress={() => confirmDeletePlaylist(menuPlaylist)}
+            />
+          </>
+        )}
       </Sheet>
+
+      {/* Renombrar lista */}
+      <PromptSheet
+        visible={!!renaming}
+        onClose={() => setRenaming(null)}
+        title="Renombrar lista"
+        confirmLabel="Guardar"
+        fields={[{ key: 'name', initial: renaming?.name, required: true }]}
+        onSubmit={async ({ name }) => {
+          if (renaming) await renamePlaylist(renaming.id, name);
+        }}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bg },
+
+  sortBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.xs,
+    paddingBottom: 4,
+  },
+  sortText: { ...type.small, color: colors.textMuted },
 
   segmented: {
     flexDirection: 'row',
@@ -333,6 +496,26 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
   },
   searchInput: { flex: 1, ...type.body, color: colors.text, padding: 0 },
+
+  playRow: {
+    flexDirection: 'row',
+    gap: space.md,
+    paddingHorizontal: space.lg,
+    paddingTop: space.md,
+    paddingBottom: space.sm,
+  },
+  playBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: space.sm,
+    height: 40,
+    borderRadius: radius.md,
+    backgroundColor: colors.surfaceHi,
+  },
+  playBtnPrimary: { backgroundColor: colors.accent },
+  playBtnText: { ...type.heading, color: colors.text, fontSize: 14 },
 
   emptyWrap: { height: 420 },
   noResults: {
@@ -381,29 +564,4 @@ const styles = StyleSheet.create({
   },
   listName: { ...type.body, color: colors.text },
   listCount: { ...type.small, color: colors.textMuted },
-
-  createBox: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: space.md,
-    paddingHorizontal: space.lg,
-    paddingBottom: space.lg,
-  },
-  createInput: {
-    flex: 1,
-    height: 48,
-    backgroundColor: colors.surfaceHi,
-    borderRadius: radius.md,
-    paddingHorizontal: space.md,
-    ...type.body,
-    color: colors.text,
-  },
-  createBtn: {
-    width: 48,
-    height: 48,
-    borderRadius: radius.md,
-    backgroundColor: colors.accent,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
 });
